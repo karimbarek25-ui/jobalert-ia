@@ -16,7 +16,7 @@ from openai import OpenAI
 # ─── CONFIGURATION ───
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY")) 
+client = OpenAI()  
 
 app = FastAPI(title="JobAlert IA", version="1.0.0")
 
