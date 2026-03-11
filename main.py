@@ -164,12 +164,13 @@ async def extraire_cv(file: UploadFile = File(...)):
         contenu = await file.read()
         doc = pymupdf.open(stream=contenu, filetype="pdf")
         texte = ""
+        nb_pages = len(doc)
         for page in doc:
             texte += page.get_text()
         doc.close()
         if not texte.strip():
             raise HTTPException(status_code=400, detail="Le PDF ne contient pas de texte extractible")
-        return {"success": True, "texte": texte.strip(), "pages": len(doc)}
+        return {"success": True, "texte": texte.strip(), "pages": nb_pages}
     except ImportError:
         raise HTTPException(status_code=500, detail="pymupdf non installé")
     except Exception as e:
