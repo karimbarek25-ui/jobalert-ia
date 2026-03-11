@@ -34,9 +34,10 @@ def verifier_token(credentials: HTTPAuthorizationCredentials = Depends(security)
     try:
         payload = jwt.decode(
             token,
-            SUPABASE_JWT_SECRET,
+            SUPABASE_JWT_SECRET.encode("utf-8"),
             algorithms=["HS256"],
             audience="authenticated"
+        ) 
         )
         return payload
     except jwt.ExpiredSignatureError:
