@@ -6,3 +6,4 @@ python-multipart
 pydantic
 pymupdf
 PyJWT
+cryptography
