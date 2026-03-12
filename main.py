@@ -425,10 +425,32 @@ def scraper_taleo_one(e: dict, mots: str = ""):
 # 🟤  PORTAILS HTML PROPRES
 # Pour les entreprises sans ATS standard
 # ══════════════════════════════════════════════
+
+_robots_cache: dict = {}
+
+def robots_autorise(url: str) -> bool:
+    """Vérifie que le scraping est autorisé via robots.txt (mis en cache)."""
+    try:
+        from urllib.robotparser import RobotFileParser
+        from urllib.parse import urlparse
+        base = urlparse(url)
+        robots_url = f"{base.scheme}://{base.netloc}/robots.txt"
+        if robots_url not in _robots_cache:
+            rp = RobotFileParser()
+            rp.set_url(robots_url)
+            rp.read()
+            _robots_cache[robots_url] = rp
+        return _robots_cache[robots_url].can_fetch("*", url)
+    except Exception:
+        return True  # En cas d'erreur, on considère autorisé
+
 def scraper_html_one(e: dict, mots: str = ""):
     """Scraper générique pour portails HTML avec BeautifulSoup"""
     result = []
     try:
+        if not robots_autorise(e["url"]):
+            print(f"[robots.txt] Scraping interdit pour {e['nom']} — ignoré")
+            return result
         from bs4 import BeautifulSoup
         r = requests.get(e["url"], headers=H_BROWSER, timeout=12)
         soup = BeautifulSoup(r.text, "html.parser")
