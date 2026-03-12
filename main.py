@@ -11,7 +11,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import jwt
 
-LBA_API_KEY = os.environ.get("LBA_API_KEY", "eyJhbGciOiJIUzI1NiJ9.eyJfaWQiOiI2OWIyMWNjYjVhZTczYTE3MWE0YTBiMTAiLCJhcGlfa2V5IjoidmJEbWhma0RVLzVrMVRCaStGa1ByRnNsRlgwSUJBKzNaT0F5ZmJWazAvUT0iLCJvcmdhbmlzYXRpb24iOm51bGwsImVtYWlsIjoia2FyaW1iYXJlazI1QGdtYWlsLmNvbSIsImlzcyI6ImFwaSIsImlhdCI6MTc3MzI4MDQ2OSwiZXhwIjoxODA0ODE2NDY5fQ.OEzLnBklaxAUf3uaOMg8nmL_amZ53FOy5ORjjCi0xE0")
+LBA_API_KEY = os.environ.get("LBA_API_KEY", "")
 
 
 # ══════════════════════════════════════════════
@@ -50,7 +50,9 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@jobalert.app")
 
 app = FastAPI(title="JobAlert IA", version="9.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()] or ["http://localhost:3000"]
+app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 security = HTTPBearer()
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
@@ -1684,7 +1686,7 @@ def envoyer_email_alerte(destinataire: str, nom: str, offres: list, poste: str):
                 <p style="color:#64748b;margin-bottom:20px;">Bonjour {nom or 'là'} 👋,<br>Voici les offres détectées aujourd'hui :</p>
                 {offres_html}
                 <div style="text-align:center;margin-top:24px;">
-                    <a href="https://jobalert-frontend.karimbarek25.workers.dev" style="background:#4f46e5;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;">Accéder à mon dashboard →</a>
+                    <a href="https://jobalertkb.fr/app" style="background:#4f46e5;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;">Accéder à mon dashboard →</a>
                 </div>
             </div>
             <div style="padding:16px 32px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;text-align:center;">JobAlert by KB — Tu reçois cet email car tu as activé les alertes</div>
@@ -1747,8 +1749,8 @@ def tester_alerte(user_id: str, user=Depends(verifier_token)):
 
         # Email de test avec offres fictives — pas de scraping pour rester rapide
         offres_test = [
-            {"titre": "Développeur Python", "entreprise": "JobAlert Test", "lieu": "Paris", "contrat": "CDI", "url": "https://jobalert-frontend.karimbarek25.workers.dev"},
-            {"titre": "Data Analyst", "entreprise": "StartupTest", "lieu": "Lyon", "contrat": "CDI", "url": "https://jobalert-frontend.karimbarek25.workers.dev"},
+            {"titre": "Développeur Python", "entreprise": "JobAlert Test", "lieu": "Paris", "contrat": "CDI", "url": "https://jobalertkb.fr/app"},
+            {"titre": "Data Analyst", "entreprise": "StartupTest", "lieu": "Lyon", "contrat": "CDI", "url": "https://jobalertkb.fr/app"},
         ]
         nom = profil.get("nom", "") or alerte["email"].split("@")[0]
         ok = envoyer_email_alerte(alerte["email"], nom, offres_test, alerte.get("poste","ton poste"))

@@ -13,10 +13,7 @@ from openai import OpenAI
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-OPENAI_API_KEY = "REMPLACE_PAR_CLE_OPENAI"
-import os
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-client = OpenAI()
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
 
 def analyser_cv(texte_cv: str) -> dict:
