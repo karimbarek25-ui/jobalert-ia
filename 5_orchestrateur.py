@@ -10,10 +10,29 @@ import hashlib
 import requests
 from datetime import datetime
 
-from france_travail import rechercher_offres, get_offres_recentes
-from ats_scraper import scraper_tous_ats
-from ia_engine import analyser_cv, scorer_compatibilite, adapter_cv, generer_lettre_motivation
-from notifications import envoyer_notification_offre
+import importlib.util, sys, pathlib
+
+def _load(short, full_name):
+    p = pathlib.Path(__file__).parent / full_name
+    spec = importlib.util.spec_from_file_location(short, p)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[short] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_ft   = _load("france_travail", "1_france_travail.py")
+_ats  = _load("ats_scraper",    "2_ats_scraper.py")
+_ia   = _load("ia_engine",      "3_ia_engine.py")
+_notif= _load("notifications",  "4_notifications.py")
+
+rechercher_offres           = _ft.rechercher_offres
+get_offres_recentes         = _ft.get_offres_recentes
+scraper_tous_ats            = _ats.scraper_tous_ats
+analyser_cv                 = _ia.analyser_cv
+scorer_compatibilite        = _ia.scorer_compatibilite
+adapter_cv                  = _ia.adapter_cv
+generer_lettre_motivation   = _ia.generer_lettre_motivation
+envoyer_notification_offre  = _notif.envoyer_notification_offre
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
