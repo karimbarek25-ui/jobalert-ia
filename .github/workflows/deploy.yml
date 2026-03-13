@@ -19,7 +19,14 @@ jobs:
             cd /opt/jobalert-ia
             git pull origin main
             docker build -t jobalert-ia .
-            docker restart jobalert-ia
+            docker stop jobalert-ia || true
+            docker rm jobalert-ia || true
+            docker run -d --name jobalert-ia \
+              --restart unless-stopped \
+              --env-file /opt/jobalert-ia/.env \
+              -p 8080:8000 \
+              jobalert-ia \
+              uvicorn main:app --host 0.0.0.0 --port 8000
             docker stop jobalert-orchestrateur 2>/dev/null || true
             docker rm jobalert-orchestrateur 2>/dev/null || true
             docker run -d --name jobalert-orchestrateur \
