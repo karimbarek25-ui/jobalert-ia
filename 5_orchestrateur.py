@@ -26,7 +26,6 @@ _ia   = _load("ia_engine",      "3_ia_engine.py")
 _notif= _load("notifications",  "4_notifications.py")
 
 rechercher_offres           = _ft.rechercher_offres
-get_offres_recentes         = _ft.get_offres_recentes
 scraper_tous_ats            = _ats.scraper_tous_ats
 analyser_cv                 = _ia.analyser_cv
 scorer_compatibilite        = _ia.scorer_compatibilite
@@ -230,7 +229,7 @@ def cycle_surveillance():
 
     nouvelles_offres = []
     for utilisateur in utilisateurs:
-        offres_ft = get_offres_recentes(utilisateur["criteres"], depuis_minutes=10)
+        offres_ft = rechercher_offres(utilisateur.get("criteres", {}))
         nouvelles_offres.extend(offres_ft)
 
     offres_ats = scraper_tous_ats()
