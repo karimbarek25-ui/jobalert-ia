@@ -98,6 +98,36 @@ def verifier_token(credentials: HTTPAuthorizationCredentials = Depends(security)
             raise HTTPException(status_code=401, detail=f"Token invalide : {str(e)}")
     raise HTTPException(status_code=401, detail="Impossible de vérifier le token")
 
+# ─── ABONNEMENT ───
+def _sb_service_headers():
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_ANON_KEY)
+    return {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+
+def get_subscription(user_id: str) -> dict:
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data", headers=_sb_service_headers(), timeout=5)
+    if r.status_code == 200 and r.json():
+        return r.json()[0].get("data", {}).get("subscription", {})
+    return {}
+
+def is_subscribed(user_id: str) -> bool:
+    sub = get_subscription(user_id)
+    if sub.get("promo"):
+        return True
+    if sub.get("status") == "active":
+        return sub.get("current_period_end", 0) > time.time()
+    return False
+
+def set_subscription(user_id: str, data: dict):
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data", headers=_sb_service_headers(), timeout=5)
+    existing = r.json()[0].get("data", {}) if r.status_code == 200 and r.json() else {}
+    existing["subscription"] = {**existing.get("subscription", {}), **data}
+    requests.patch(f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}", headers=_sb_service_headers(), json={"data": existing, "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=5)
+
+def verifier_abonnement(user=Depends(verifier_token)):
+    if not is_subscribed(user.get("sub", "")):
+        raise HTTPException(status_code=402, detail="Abonnement requis.")
+    return user
+
 # ─── MODÈLES ───
 class CriteresRecherche(BaseModel):
     motsCles: str
@@ -1850,60 +1880,6 @@ STRIPE_PRICE_ID      = os.environ.get("STRIPE_PRICE_ID", "price_1TALz2E3fm1yXIDs
 APP_URL              = os.environ.get("APP_URL", "https://jobalertkb.fr/app")
 
 _stripe.api_key = STRIPE_SECRET_KEY
-
-def _sb_service_headers():
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_ANON_KEY)
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation"
-    }
-
-def get_subscription(user_id: str) -> dict:
-    """Retourne les infos d'abonnement depuis Supabase."""
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data",
-        headers=_sb_service_headers(), timeout=5
-    )
-    if r.status_code == 200 and r.json():
-        return r.json()[0].get("data", {}).get("subscription", {})
-    return {}
-
-def is_subscribed(user_id: str) -> bool:
-    """Vérifie si l'utilisateur a un abonnement actif ou promo."""
-    sub = get_subscription(user_id)
-    if sub.get("promo"):
-        return True
-    if sub.get("status") == "active":
-        end = sub.get("current_period_end", 0)
-        return end > time.time()
-    return False
-
-def set_subscription(user_id: str, data: dict):
-    """Met à jour les infos d'abonnement dans Supabase."""
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data",
-        headers=_sb_service_headers(), timeout=5
-    )
-    existing = {}
-    if r.status_code == 200 and r.json():
-        existing = r.json()[0].get("data", {})
-    existing["subscription"] = {**existing.get("subscription", {}), **data}
-    requests.patch(
-        f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}",
-        headers=_sb_service_headers(),
-        json={"data": existing, "updated_at": datetime.now(timezone.utc).isoformat()},
-        timeout=5
-    )
-
-def verifier_abonnement(user=Depends(verifier_token)):
-    """Dependency FastAPI — bloque si pas abonné."""
-    user_id = user.get("sub", "")
-    if not is_subscribed(user_id):
-        raise HTTPException(status_code=402, detail="Abonnement requis. Accédez à /billing/checkout pour vous abonner.")
-    return user
-
 
 @app.get("/billing/status")
 def billing_status(user=Depends(verifier_token)):
