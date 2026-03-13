@@ -1502,14 +1502,14 @@ def route_analyser_cv(demande: AnalyseCV, user=Depends(verifier_token)):
         raise HTTPException(500, str(e))
 
 @app.post("/ia/scorer")
-def route_scorer(demande: DemandeScoring, user=Depends(verifier_token)):
+def route_scorer(demande: DemandeScoring, user=Depends(verifier_abonnement)):
     try:
         return {"success": True, "score": scorer(demande.profil, demande.offre)}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.post("/ia/scorer-batch")
-def route_scorer_batch(req: dict, user=Depends(verifier_token)):
+def route_scorer_batch(req: dict, user=Depends(verifier_abonnement)):
     try:
         profil = req.get("profil", {})
         offres = req.get("offres", [])
@@ -1525,14 +1525,14 @@ def route_scorer_batch(req: dict, user=Depends(verifier_token)):
         raise HTTPException(500, str(e))
 
 @app.post("/ia/lettre")
-def route_lettre(demande: DemandeLettre, user=Depends(verifier_token)):
+def route_lettre(demande: DemandeLettre, user=Depends(verifier_abonnement)):
     try:
         return {"success": True, "lettre": generer_lettre(demande.profil, demande.offre)}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.post("/ia/adapter-lettre")
-def route_adapter_lettre(demande: DemandeAdapterLettre, user=Depends(verifier_token)):
+def route_adapter_lettre(demande: DemandeAdapterLettre, user=Depends(verifier_abonnement)):
     """Adapte la LM personnelle de l'utilisateur à l'offre"""
     try:
         lm_adaptee = adapter_lettre(demande.profil, demande.offre, demande.lm_base)
@@ -1542,7 +1542,7 @@ def route_adapter_lettre(demande: DemandeAdapterLettre, user=Depends(verifier_to
 
 
 @app.post("/ia/package-complet")
-def route_package(demande: DemandePackageComplet, user=Depends(verifier_token)):
+def route_package(demande: DemandePackageComplet, user=Depends(verifier_abonnement)):
     """Score + LM adaptée (depuis base perso ou générée depuis zéro)"""
     try:
         s = scorer(demande.profil, demande.offre)
@@ -1837,3 +1837,201 @@ def get_analytics(user_id: str, user=Depends(verifier_token)):
         }
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ══════════════════════════════════════════════
+# 💳  BILLING — STRIPE
+# ══════════════════════════════════════════════
+import stripe as _stripe
+
+STRIPE_SECRET_KEY    = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID      = os.environ.get("STRIPE_PRICE_ID", "price_1TALz2E3fm1yXIDs9U2JEmi9")
+APP_URL              = os.environ.get("APP_URL", "https://jobalertkb.fr/app")
+
+_stripe.api_key = STRIPE_SECRET_KEY
+
+def _sb_service_headers():
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_ANON_KEY)
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+def get_subscription(user_id: str) -> dict:
+    """Retourne les infos d'abonnement depuis Supabase."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data",
+        headers=_sb_service_headers(), timeout=5
+    )
+    if r.status_code == 200 and r.json():
+        return r.json()[0].get("data", {}).get("subscription", {})
+    return {}
+
+def is_subscribed(user_id: str) -> bool:
+    """Vérifie si l'utilisateur a un abonnement actif ou promo."""
+    sub = get_subscription(user_id)
+    if sub.get("promo"):
+        return True
+    if sub.get("status") == "active":
+        end = sub.get("current_period_end", 0)
+        return end > time.time()
+    return False
+
+def set_subscription(user_id: str, data: dict):
+    """Met à jour les infos d'abonnement dans Supabase."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data",
+        headers=_sb_service_headers(), timeout=5
+    )
+    existing = {}
+    if r.status_code == 200 and r.json():
+        existing = r.json()[0].get("data", {})
+    existing["subscription"] = {**existing.get("subscription", {}), **data}
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}",
+        headers=_sb_service_headers(),
+        json={"data": existing, "updated_at": datetime.now(timezone.utc).isoformat()},
+        timeout=5
+    )
+
+def verifier_abonnement(user=Depends(verifier_token)):
+    """Dependency FastAPI — bloque si pas abonné."""
+    user_id = user.get("sub", "")
+    if not is_subscribed(user_id):
+        raise HTTPException(status_code=402, detail="Abonnement requis. Accédez à /billing/checkout pour vous abonner.")
+    return user
+
+
+@app.get("/billing/status")
+def billing_status(user=Depends(verifier_token)):
+    """Retourne le statut d'abonnement de l'utilisateur connecté."""
+    user_id = user.get("sub", "")
+    sub = get_subscription(user_id)
+    active = is_subscribed(user_id)
+    return {
+        "subscribed": active,
+        "status": sub.get("status", "inactive"),
+        "promo": sub.get("promo", False),
+        "current_period_end": sub.get("current_period_end"),
+        "stripe_customer_id": sub.get("stripe_customer_id")
+    }
+
+
+@app.post("/billing/checkout")
+def billing_checkout(user=Depends(verifier_token)):
+    """Crée une session Stripe Checkout et retourne l'URL."""
+    user_id = user.get("sub", "")
+    email = user.get("email", "")
+    try:
+        sub = get_subscription(user_id)
+        customer_id = sub.get("stripe_customer_id")
+        if not customer_id:
+            customer = _stripe.Customer.create(email=email, metadata={"user_id": user_id})
+            customer_id = customer.id
+            set_subscription(user_id, {"stripe_customer_id": customer_id})
+        session = _stripe.checkout.Session.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            mode="subscription",
+            success_url=f"{APP_URL}?payment=success",
+            cancel_url=f"{APP_URL}?payment=cancel",
+            metadata={"user_id": user_id}
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/billing/portal")
+def billing_portal(user=Depends(verifier_token)):
+    """Ouvre le portail Stripe pour gérer/annuler l'abonnement."""
+    user_id = user.get("sub", "")
+    sub = get_subscription(user_id)
+    customer_id = sub.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(400, "Aucun abonnement trouvé.")
+    try:
+        session = _stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=APP_URL
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/billing/webhook")
+async def billing_webhook(request: Request):
+    """Webhook Stripe — met à jour le statut d'abonnement."""
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        event = _stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    etype = event["type"]
+    obj = event["data"]["object"]
+
+    if etype == "checkout.session.completed":
+        user_id = obj.get("metadata", {}).get("user_id", "")
+        sub_id = obj.get("subscription")
+        if user_id and sub_id:
+            stripe_sub = _stripe.Subscription.retrieve(sub_id)
+            set_subscription(user_id, {
+                "status": "active",
+                "stripe_subscription_id": sub_id,
+                "current_period_end": stripe_sub["current_period_end"]
+            })
+
+    elif etype == "invoice.payment_succeeded":
+        sub_id = obj.get("subscription")
+        if sub_id:
+            stripe_sub = _stripe.Subscription.retrieve(sub_id)
+            cust_id = stripe_sub["customer"]
+            customers = _stripe.Customer.list(limit=1)
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/user_data?select=user_id,data&data->>subscription->>stripe_customer_id=eq.{cust_id}",
+                headers=_sb_service_headers(), timeout=5
+            )
+            if r.status_code == 200 and r.json():
+                user_id = r.json()[0]["user_id"]
+                set_subscription(user_id, {
+                    "status": "active",
+                    "current_period_end": stripe_sub["current_period_end"]
+                })
+
+    elif etype in ("customer.subscription.deleted", "invoice.payment_failed"):
+        sub_id = obj.get("id") if etype == "customer.subscription.deleted" else obj.get("subscription")
+        if sub_id:
+            cust_id = obj.get("customer")
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/user_data?select=user_id,data",
+                headers=_sb_service_headers(), timeout=5
+            )
+            if r.status_code == 200:
+                for row in r.json():
+                    s = row.get("data", {}).get("subscription", {})
+                    if s.get("stripe_customer_id") == cust_id:
+                        set_subscription(row["user_id"], {"status": "inactive"})
+                        break
+
+    return {"received": True}
+
+
+@app.post("/billing/promo")
+def billing_promo(req: dict, user=Depends(verifier_token)):
+    """Donne un accès promo à un utilisateur (admin uniquement via secret)."""
+    secret = req.get("secret", "")
+    target_user_id = req.get("user_id", "")
+    admin_secret = os.environ.get("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        raise HTTPException(403, "Non autorisé.")
+    if not target_user_id:
+        raise HTTPException(400, "user_id requis.")
+    set_subscription(target_user_id, {"promo": True, "status": "active", "current_period_end": 9999999999})
+    return {"success": True, "message": f"Accès promo activé pour {target_user_id}"}
