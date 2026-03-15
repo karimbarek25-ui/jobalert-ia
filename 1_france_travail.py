@@ -1,11 +1,15 @@
+import os
 import requests
 import json
 from datetime import datetime
 
-CLIENT_ID = "PAR_jobalertia_b59e2d4a190d56f20dd6dcd311f27970aba842a9a34f6a59a9f02034683e78cb"
-CLIENT_SECRET = "ae82b2d6826406d16fd75a30531edd8c0633b9a08cb89d969c1f99bcba8bbcd3"
+# Ne jamais committer les vraies valeurs — utiliser les variables d'environnement
+CLIENT_ID = os.environ.get("CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
 
 def get_access_token():
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise ValueError("CLIENT_ID et CLIENT_SECRET France Travail doivent être définis (variables d'environnement)")
     url = "https://entreprise.francetravail.fr/connexion/oauth2/access_token"
     params = {"realm": "/partenaire"}
     data = {
@@ -58,6 +62,33 @@ def rechercher_offres(criteres):
 
     print(f"✅ {len(offres_normalisees)} offres récupérées depuis France Travail")
     return offres_normalisees
+
+
+def get_offres_recentes(criteres: dict, depuis_minutes: int = 10) -> list:
+    """Retourne les offres dont la date de publication est dans les N dernières minutes."""
+    from datetime import datetime, timezone, timedelta
+    toutes = rechercher_offres(criteres)
+    if depuis_minutes <= 0:
+        return toutes
+    seuil = datetime.now(timezone.utc) - timedelta(minutes=depuis_minutes)
+    recentes = []
+    for o in toutes:
+        dp = o.get("date_publication")
+        if not dp:
+            continue
+        try:
+            if isinstance(dp, str) and "T" in dp:
+                dt = datetime.fromisoformat(dp.replace("Z", "+00:00"))
+            else:
+                dt = datetime.fromisoformat(str(dp).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt >= seuil:
+                recentes.append(o)
+        except Exception:
+            pass
+    return recentes
+
 
 if __name__ == "__main__":
     criteres_test = {

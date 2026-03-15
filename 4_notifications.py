@@ -14,14 +14,15 @@ from datetime import datetime, timedelta
 
 # ─────────────────────────────────────────────
 # CONFIGURATION EMAIL (Brevo recommandé)
-# Inscription gratuite sur : https://brevo.com
+# Toutes les valeurs via variables d'environnement — ne jamais committer de secrets
 # ─────────────────────────────────────────────
-SMTP_HOST = "smtp-relay.brevo.com"
-SMTP_PORT = 587
-SMTP_USER = "TON_EMAIL@domaine.com"
-SMTP_PASSWORD = "TON_MOT_DE_PASSE_BREVO"
-EMAIL_EXPEDITEUR = "notifications@ton-saas.fr"
-NOM_EXPEDITEUR = "JobAlert IA"
+import os
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp-relay.brevo.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+EMAIL_EXPEDITEUR = os.environ.get("EMAIL_EXPEDITEUR", "")
+NOM_EXPEDITEUR = os.environ.get("NOM_EXPEDITEUR", "JobAlert IA")
 
 
 def envoyer_notification_offre(destinataire: str, offre: dict, score: dict, prenom: str = ""):

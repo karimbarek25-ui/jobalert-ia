@@ -1,101 +1,550 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+<<<<<<< HEAD
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from typing import Optional
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List, Any
 import json
 import os
 import requests
-import io
-from datetime import datetime
+from datetime import datetime, date, timedelta, timezone
+from collections import deque
+from threading import Lock
+import hashlib
 import jwt  # PyJWT
+
+from config import (
+    MAX_PDF_BYTES,
+    MAX_CV_TEXT_CHARS,
+    MAX_JSON_BODY_BYTES,
+    MAX_OFFRES_RESULTS,
+    REQUEST_TIMEOUT_SEC,
+    OPENAI_TIMEOUT_SEC,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW_SEC,
+    RATE_LIMIT_IA_REQUESTS,
+    RATE_LIMIT_IA_WINDOW_SEC,
+    CACHE_OFFRES_TTL_SEC,
+    CACHE_SCORER_TTL_SEC,
+)
 
 app = FastAPI(title="JobAlert IA", version="1.0.0")
 
+# ─── Limite taille body (sécurité + coût) ───
+app.router.redirect_slashes = False
+
+# ─── Rate limiting en mémoire (pas de Redis requis, tu restes propriétaire) ───
+_rate_limit_lock = Lock()
+_rate_limit_store: dict[str, deque] = {}
+_ia_rate_limit_store: dict[str, deque] = {}
+
+def _rate_limit_key(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _check_rate_limit(store: dict, key: str, max_requests: int, window_sec: int) -> bool:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=window_sec)
+    with _rate_limit_lock:
+        if key not in store:
+            store[key] = deque(maxlen=max_requests * 2)
+        q = store[key]
+        while q and q[0] < cutoff:
+            q.popleft()
+        if len(q) >= max_requests:
+            return False
+        q.append(now)
+    return True
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    key = _rate_limit_key(request)
+    is_ia_route = request.url.path.startswith("/ia/") or request.url.path == "/cv/extraire"
+    if is_ia_route:
+        ok = _check_rate_limit(_ia_rate_limit_store, key, RATE_LIMIT_IA_REQUESTS, RATE_LIMIT_IA_WINDOW_SEC)
+    else:
+        ok = _check_rate_limit(_rate_limit_store, key, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SEC)
+    if not ok:
+        return JSONResponse(status_code=429, content={"detail": "Trop de requêtes. Réessaie dans une minute."})
+    return await call_next(request)
+
+# ─── En-têtes de sécurité ───
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    return response
+
+# CORS : restreint aux origines réelles (prod + dev)
+_CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "https://jobalertkb.fr,https://www.jobalertkb.fr").strip()
+CORS_ORIGINS = [o.strip() for o in _CORS_ORIGINS.split(",") if o.strip()]
+if not CORS_ORIGINS:
+    CORS_ORIGINS = ["https://jobalertkb.fr", "https://www.jobalertkb.fr"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+=======
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from typing import Optional
+import json, os, requests, re, time, hashlib, threading, smtplib
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import jwt
 
-# ─── SÉCURITÉ SUPABASE ───
+LBA_API_KEY = os.environ.get("LBA_API_KEY", "")
+
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
+
+# ══════════════════════════════════════════════
+# 🗄️  CACHE MÉMOIRE (TTL 15 min)
+# ══════════════════════════════════════════════
+_cache_offres: dict = {}          # {clé: {"ts": float, "data": list, "erreurs": list}}
+_cache_lock = threading.Lock()
+CACHE_TTL = 900  # 15 minutes
+
+def _cache_key(mots: str, localisation: str, contrat: str) -> str:
+    raw = f"{mots.lower().strip()}|{localisation.lower().strip()}|{contrat.lower().strip()}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+def cache_get(mots: str, localisation: str, contrat: str):
+    key = _cache_key(mots, localisation, contrat)
+    with _cache_lock:
+        entry = _cache_offres.get(key)
+        if entry and (time.time() - entry["ts"]) < CACHE_TTL:
+            return entry["data"], entry["erreurs"], True  # (data, erreurs, hit)
+    return None, None, False
+
+def cache_set(mots: str, localisation: str, contrat: str, data: list, erreurs: list):
+    key = _cache_key(mots, localisation, contrat)
+    with _cache_lock:
+        _cache_offres[key] = {"ts": time.time(), "data": data, "erreurs": erreurs}
+
+def cache_clear():
+    with _cache_lock:
+        _cache_offres.clear()
+
+# Variables SMTP (optionnelles — pour alertes email)
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@jobalert.app")
+
+app = FastAPI(title="JobAlert IA", version="9.0.0")
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()] or ["http://localhost:3000"]
+app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
 security = HTTPBearer()
+<<<<<<< HEAD
+security_optional = HTTPBearer(auto_error=False)
 
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+LIMIT_CANDIDATURES_FREE = int(os.environ.get("LIMIT_CANDIDATURES_FREE", "3"))
+INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")  # Pour set-premium (WordPress)
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")  # Optionnel : webhook Stripe
 
 def verifier_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Vérifie le JWT Supabase. Lève une 401 si invalide."""
-    token = credentials.credentials
-    if not SUPABASE_JWT_SECRET:
-        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET manquant côté serveur")
-    try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated"
-        )
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expiré — reconnecte-toi")
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Token invalide : {str(e)}")
+    """Vérifie le JWT Supabase. Lève une 401 si invalide. Retourne le payload avec sub = user_id."""
+=======
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 
-# ─── MODÈLES ───
+def supabase_headers():
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+_jwks_client = None
+def get_jwks_client():
+    global _jwks_client
+    if _jwks_client is None and SUPABASE_URL:
+        try:
+            from jwt import PyJWKClient
+            _jwks_client = PyJWKClient(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
+        except (ImportError, Exception):
+            pass
+    return _jwks_client
+
+def verifier_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
+    token = credentials.credentials
+    try:
+        client = get_jwks_client()
+        if client:
+            signing_key = client.get_signing_key_from_jwt(token)
+            payload = jwt.decode(token, signing_key.key, algorithms=["ES256", "RS256"], audience="authenticated")
+            return payload
+    except Exception:
+        pass
+    if SUPABASE_JWT_SECRET:
+        try:
+            payload = jwt.decode(token, SUPABASE_JWT_SECRET.encode("utf-8"), algorithms=["HS256"], audience="authenticated")
+            return payload
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token expiré")
+        except jwt.InvalidTokenError as e:
+            raise HTTPException(status_code=401, detail=f"Token invalide : {str(e)}")
+    raise HTTPException(status_code=401, detail="Impossible de vérifier le token")
+
+# ─── ABONNEMENT ───
+def _sb_service_headers():
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_ANON_KEY)
+    return {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+
+def get_subscription(user_id: str) -> dict:
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data", headers=_sb_service_headers(), timeout=5)
+    if r.status_code == 200 and r.json():
+        return r.json()[0].get("data", {}).get("subscription", {})
+    return {}
+
+def is_subscribed(user_id: str) -> bool:
+    sub = get_subscription(user_id)
+    if sub.get("promo"):
+        return True
+    if sub.get("status") == "active":
+        return sub.get("current_period_end", 0) > time.time()
+    return False
+
+def set_subscription(user_id: str, data: dict):
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=data", headers=_sb_service_headers(), timeout=5)
+    existing = r.json()[0].get("data", {}) if r.status_code == 200 and r.json() else {}
+    existing["subscription"] = {**existing.get("subscription", {}), **data}
+    requests.patch(f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}", headers=_sb_service_headers(), json={"data": existing, "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=5)
+
+def verifier_abonnement(user=Depends(verifier_token)):
+    if not is_subscribed(user.get("sub", "")):
+        raise HTTPException(status_code=402, detail="Abonnement requis.")
+    return user
+
+def get_current_user_id(payload: dict = Depends(verifier_token)) -> str:
+    """Retourne l'user_id (Supabase auth.users.id) du JWT."""
+    uid = payload.get("sub")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Token invalide (sub manquant)")
+    return uid
+
+# ─── MODÈLES (validation stricte = sécurité + coût maîtrisé) ───
+def _check_json_size(v: dict, max_bytes: int = 100_000) -> dict:
+    if len(json.dumps(v, ensure_ascii=False).encode("utf-8")) > max_bytes:
+        raise ValueError("Payload trop volumineux")
+    return v
+
 class CriteresRecherche(BaseModel):
+<<<<<<< HEAD
+    motsCles: str = Field(..., max_length=200)
+    typeContrat: Optional[str] = Field("", max_length=20)
+    distance: Optional[int] = Field(30, ge=0, le=100)
+    nbResultats: Optional[int] = Field(20, ge=1, le=MAX_OFFRES_RESULTS)
+=======
     motsCles: str
     typeContrat: Optional[str] = ""
+    localisation: Optional[str] = ""
     distance: Optional[int] = 30
     nbResultats: Optional[int] = 20
+    page: Optional[int] = 1
+
+class AlerteEmail(BaseModel):
+    user_id: str
+    email: str
+    poste: str
+    ville: str = ""
+    contrat: str = ""
+    score_min: int = 70
+    active: bool = True
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 class DemandeScoring(BaseModel):
     profil: dict
     offre: dict
+    @field_validator("profil", "offre")
+    @classmethod
+    def limit_size(cls, v: dict) -> dict:
+        return _check_json_size(v, 80_000)
 
+<<<<<<< HEAD
 class DemandeCV(BaseModel):
     profil: dict
     offre: dict
-    cv_original: str
+    cv_original: str = Field(..., max_length=MAX_CV_TEXT_CHARS)
+    @field_validator("profil", "offre")
+    @classmethod
+    def limit_size(cls, v: dict) -> dict:
+        return _check_json_size(v, 80_000)
 
+=======
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 class DemandeLettre(BaseModel):
     profil: dict
     offre: dict
+    @field_validator("profil", "offre")
+    @classmethod
+    def limit_size(cls, v: dict) -> dict:
+        return _check_json_size(v, 80_000)
 
 class AnalyseCV(BaseModel):
-    texte_cv: str
+    texte_cv: str = Field(..., max_length=MAX_CV_TEXT_CHARS)
 
-# ─── HELPERS ───
+class CandidatureCreate(BaseModel):
+    offre: dict
+    score: dict
+    cv_adapte: Optional[str] = Field("", max_length=MAX_CV_TEXT_CHARS)
+    lettre: Optional[str] = Field("", max_length=50_000)
+    @field_validator("offre")
+    @classmethod
+    def limit_offre(cls, v: dict) -> dict:
+        return _check_json_size(v, 100_000)
+    @field_validator("score")
+    @classmethod
+    def limit_score(cls, v: dict) -> dict:
+        return _check_json_size(v, 10_000)
+
+class SetPremiumBody(BaseModel):
+    user_id: str = Field(..., max_length=64)
+    plan: str = Field(..., max_length=20)
+
+# ─── STOCKAGE : Supabase si configuré, sinon JSON (aucune config manuelle requise) ───
+_supabase = None
+PROFILES_JSON = "profiles.json"
+
+def _use_supabase() -> bool:
+    """True si Supabase est configuré (URL + clé service). Sinon on utilise les fichiers JSON."""
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+def get_supabase():
+    global _supabase
+    if not _use_supabase():
+        return None
+    if _supabase is None:
+        from supabase import create_client
+        _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return _supabase
+
+def _profiles_json() -> dict:
+    """Charge profiles.json (user_id -> plan). Crée le fichier si absent."""
+    if os.path.exists(PROFILES_JSON):
+        try:
+            with open(PROFILES_JSON, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_profiles(data: dict):
+    with open(PROFILES_JSON, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_user_plan(user_id: str) -> str:
+    """Retourne 'free' ou 'premium'. Crée le profil en free si absent."""
+    if _use_supabase():
+        try:
+            sb = get_supabase()
+            r = sb.table("profiles").select("plan").eq("user_id", user_id).execute()
+            if r.data and len(r.data) > 0:
+                return r.data[0].get("plan", "free") or "free"
+            sb.table("profiles").upsert({"user_id": user_id, "plan": "free"}, on_conflict="user_id").execute()
+            return "free"
+        except Exception:
+            return "free"
+    # Fallback JSON
+    data = _profiles_json()
+    plan = data.get(user_id, "free")
+    if user_id not in data:
+        data[user_id] = "free"
+        _save_profiles(data)
+    return plan
+
+def set_user_plan(user_id: str, plan: str) -> None:
+    """Met à jour le plan (free | premium). Utilisé par webhook Stripe / set-premium."""
+    if plan not in ("free", "premium"):
+        return
+    if _use_supabase():
+        try:
+            sb = get_supabase()
+            sb.table("profiles").upsert({"user_id": user_id, "plan": plan}, on_conflict="user_id").execute()
+        except Exception:
+            pass
+        return
+    data = _profiles_json()
+    data[user_id] = plan
+    _save_profiles(data)
+
+def count_candidatures_aujourd_hui(user_id: str) -> int:
+    """Nombre de candidatures créées aujourd'hui (UTC) pour cet utilisateur."""
+    if _use_supabase():
+        try:
+            sb = get_supabase()
+            today_start = date.today().isoformat() + "T00:00:00.000Z"
+            tomorrow_start = (date.today() + timedelta(days=1)).isoformat() + "T00:00:00.000Z"
+            r = sb.table("candidatures").select("id").eq("user_id", user_id).gte("created_at", today_start).lt("created_at", tomorrow_start).execute()
+            return len(r.data or [])
+        except Exception:
+            return 0
+    # Fallback JSON
+    path = f"candidatures_{user_id}.json"
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+        today_str = date.today().isoformat()
+        return sum(1 for r in rows if (r.get("date_preparation") or r.get("created_at") or "")[:10] == today_str)
+    except Exception:
+        return 0
+
+class SauvegardeOffre(BaseModel):
+    user_id: str
+    offre: dict
+
+class MajCandidature(BaseModel):
+    user_id: str
+    offre_id: str
+    statut: str
+    offre: Optional[dict] = None
+
+class SauvegardeProfile(BaseModel):
+    user_id: str
+    profil: dict
+    criteres: dict
+    lm_base: Optional[str] = None
+
+class SauvegardeCV(BaseModel):
+    user_id: str
+    cv_texte: str
+    cv_base64: Optional[str] = None
+
+class DemandeAdapterLettre(BaseModel):
+    profil: dict
+    offre: dict
+    lm_base: str  # LM personnelle de l'utilisateur
+
+class DemandePackageComplet(BaseModel):
+    profil: dict
+    offre: dict
+    lm_base: Optional[str] = None
+
+class DemandeLMPDF(BaseModel):
+    texte_lm: str
+    titre_offre: Optional[str] = ""
+    entreprise: Optional[str] = ""
+    nom_candidat: Optional[str] = ""
+
+# ─── HEADERS ───
+H_BROWSER = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+}
+H_JSON = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+}
+
+# ─── UTILITAIRES ───
 def get_openai_client():
     from openai import OpenAI
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=OPENAI_TIMEOUT_SEC)
+
+def match(texte: str, mots: str) -> bool:
+    if not mots:
+        return True
+    return any(m.lower() in texte.lower() for m in mots.split())
+
+def offre(id, titre, entreprise, lieu, contrat, salaire, description, date, url, source, competences=None):
+    return {
+        "id": str(id), "titre": titre or "Non précisé", "entreprise": entreprise or "Non précisé",
+        "lieu": lieu or "Non précisé", "contrat": contrat or "Non précisé",
+        "salaire": salaire or "Non précisé", "description": (description or "")[:600],
+        "date_publication": date or datetime.now().isoformat(),
+        "url": url or "#", "source": source, "competences": competences or []
+    }
+<<<<<<< HEAD
+    r = requests.post(url, params={"realm": "/partenaire"}, data=data, timeout=REQUEST_TIMEOUT_SEC)
+=======
 
 def get_access_token():
-    url = "https://entreprise.francetravail.fr/connexion/oauth2/access_token"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": os.environ["CLIENT_ID"],
-        "client_secret": os.environ["CLIENT_SECRET"],
-        "scope": "api_offresdemploiv2 o2dsoffre"
-    }
-    r = requests.post(url, params={"realm": "/partenaire"}, data=data, timeout=10)
+    r = requests.post(
+        "https://entreprise.francetravail.fr/connexion/oauth2/access_token",
+        params={"realm": "/partenaire"},
+        data={"grant_type": "client_credentials", "client_id": os.environ["CLIENT_ID"],
+              "client_secret": os.environ["CLIENT_SECRET"], "scope": "api_offresdemploiv2 o2dsoffre"},
+        timeout=10
+    )
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     r.raise_for_status()
     return r.json()["access_token"]
 
-def rechercher_offres(criteres):
+# ══════════════════════════════════════════════
+# 🔵  FRANCE TRAVAIL
+# ══════════════════════════════════════════════
+# Correspondance villes → codes postaux pour l'API France Travail
+# L'API attend commune=CODE_POSTAL (ex: "13000" pour Marseille)
+CODES_POSTAUX = {
+    "paris": "75000", "marseille": "13000", "lyon": "69000", "toulouse": "31000",
+    "nice": "06000", "nantes": "44000", "montpellier": "34000", "strasbourg": "67000",
+    "bordeaux": "33000", "lille": "59000", "rennes": "35000", "reims": "51000",
+    "saint-etienne": "42000", "toulon": "83000", "grenoble": "38000", "dijon": "21000",
+    "angers": "49000", "nimes": "30000", "villeurbanne": "69100", "le mans": "72000",
+    "aix-en-provence": "13100", "clermont-ferrand": "63000", "brest": "29000",
+    "limoges": "87000", "tours": "37000", "amiens": "80000", "perpignan": "66000",
+    "metz": "57000", "besancon": "25000", "orleans": "45000", "mulhouse": "68100",
+    "rouen": "76000", "caen": "14000", "nancy": "54000", "argenteuil": "95100",
+    "montreuil": "93100", "roubaix": "59100", "tourcoing": "59200", "avignon": "84000",
+    "versailles": "78000", "poitiers": "86000", "pau": "64000", "calais": "62100",
+    "colmar": "68000", "lorient": "56100", "troyes": "10000", "annecy": "74000",
+    "saint-denis": "93200", "vitry-sur-seine": "94400", "le havre": "76600",
+}
+
+def ville_vers_code_postal(ville: str) -> str:
+    """Convertit un nom de ville en code postal pour l'API France Travail"""
+    import unicodedata, re
+    def norm(s):
+        s = unicodedata.normalize("NFD", s)
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+        return re.sub(r"[-'_]", " ", s.lower()).strip()
+    # Si déjà un code postal (5 chiffres), le retourner directement
+    v = norm(ville)
+    if re.match(r"^[0-9]{5}$", v):
+        return v
+    return CODES_POSTAUX.get(v, "")
+
+def scraper_ft(criteres: dict):
     token = get_access_token()
-    url = "https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    # range max = 149 (limitation API France Travail)
     params = {
         "motsCles": criteres.get("motsCles", ""),
-        "range": f"0-{criteres.get('nbResultats', 10) - 1}",
-        "sort": "1"
+        "range": "0-149",
+        "sort": "1"  # tri par date
     }
     if criteres.get("typeContrat"):
         params["typeContrat"] = criteres["typeContrat"]
-    r = requests.get(url, headers=headers, params=params, timeout=15)
+<<<<<<< HEAD
+    r = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SEC)
     r.raise_for_status()
     return [{
         "id": o.get("id"),
@@ -110,17 +559,38 @@ def rechercher_offres(criteres):
         "source": "France Travail",
         "competences": [c.get("libelle") for c in o.get("competences", [])],
     } for o in r.json().get("resultats", [])]
+=======
+    if criteres.get("localisation"):
+        cp = ville_vers_code_postal(criteres["localisation"])
+        if cp:
+            # L'API France Travail accepte departement (2 chiffres) mais pas commune
+            params["departement"] = cp[:2]
+    r = requests.get(
+        "https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search",
+        headers=headers, params=params, timeout=20
+    )
+    if not r.ok:
+        raise Exception(f"FT {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    resultats = data.get("resultats", [])
+    return [offre(
+        o.get("id"), o.get("intitule"), o.get("entreprise", {}).get("nom"),
+        o.get("lieuTravail", {}).get("libelle"), o.get("typeContratLibelle"),
+        o.get("salaire", {}).get("libelle"), o.get("description"), o.get("dateCreation"),
+        o.get("origineOffre", {}).get("urlOrigine", f"https://www.francetravail.fr/offres/emploi/offre/{o.get('id')}"),
+        "France Travail", [c.get("libelle") for c in o.get("competences", [])]
+    ) for o in resultats]
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
-def scraper_tous_ats(mots_cles=""):
-    offres = []
-    for e in [
-        {"nom": "Mistral AI", "slug": "mistral"},
-        {"nom": "Qonto", "slug": "qonto"},
-        {"nom": "Pennylane", "slug": "pennylane"},
-        {"nom": "Swile", "slug": "swile"}
-    ]:
+# ══════════════════════════════════════════════
+# 🟣  LEVER
+# ══════════════════════════════════════════════
+def scraper_lever(entreprises: list, mots: str = ""):
+    result = []
+    for e in entreprises:
         try:
-            r = requests.get(f"https://api.lever.co/v0/postings/{e['slug']}?mode=json", timeout=10)
+<<<<<<< HEAD
+            r = requests.get(f"https://api.lever.co/v0/postings/{e['slug']}?mode=json", timeout=REQUEST_TIMEOUT_SEC)
             for job in r.json():
                 if mots_cles and mots_cles.lower() not in job.get("text", "").lower():
                     continue
@@ -139,13 +609,30 @@ def scraper_tous_ats(mots_cles=""):
                 })
         except:
             pass
+=======
+            r = requests.get(f"https://api.lever.co/v0/postings/{e['slug']}?mode=json", timeout=8, headers=H_JSON)
+            for j in r.json():
+                if not match(j.get("text","") + j.get("descriptionPlain",""), mots): continue
+                result.append(offre(
+                    f"lever_{j.get('id')}", j.get("text"), e["nom"],
+                    j.get("categories",{}).get("location"), j.get("categories",{}).get("commitment"),
+                    None, j.get("descriptionPlain",""),
+                    datetime.utcfromtimestamp(j.get("createdAt",0)/1000).isoformat(),
+                    j.get("hostedUrl"), f"Site carrière ({e['nom']})"
+                ))
+        except: pass
+    return result
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
-    for e in [
-        {"nom": "Doctolib", "slug": "doctolib"},
-        {"nom": "Alma", "slug": "alma"}
-    ]:
+# ══════════════════════════════════════════════
+# 🟢  GREENHOUSE
+# ══════════════════════════════════════════════
+def scraper_greenhouse(entreprises: list, mots: str = ""):
+    result = []
+    for e in entreprises:
         try:
-            r = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{e['slug']}/jobs", timeout=10)
+<<<<<<< HEAD
+            r = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{e['slug']}/jobs", timeout=REQUEST_TIMEOUT_SEC)
             for job in r.json().get("jobs", []):
                 if mots_cles and mots_cles.lower() not in job.get("title", "").lower():
                     continue
@@ -172,7 +659,12 @@ def analyser_cv(texte_cv):
 {{"nom":"...","email":"...","competences":[],"secteurs":[],"annees_experience":0,"resume_profil":"..."}}
 CV : {texte_cv}
 Réponds UNIQUEMENT avec le JSON."""
-    r = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.1)
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        timeout=OPENAI_TIMEOUT_SEC,
+    )
     contenu = r.choices[0].message.content.strip()
     if "```" in contenu:
         contenu = contenu.split("```")[1]
@@ -187,55 +679,1156 @@ def scorer_compatibilite(profil, offre):
 PROFIL: {json.dumps(profil, ensure_ascii=False)}
 OFFRE: Titre:{offre.get('titre')} Entreprise:{offre.get('entreprise')} Description:{offre.get('description','')[:400]}
 Réponds UNIQUEMENT avec le JSON."""
-    r = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.1)
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        timeout=OPENAI_TIMEOUT_SEC,
+    )
     contenu = r.choices[0].message.content.strip()
     if "```" in contenu:
         contenu = contenu.split("```")[1]
         if contenu.startswith("json"):
             contenu = contenu[4:]
     return json.loads(contenu)
+=======
+            r = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{e['slug']}/jobs", timeout=8, headers=H_JSON)
+            for j in r.json().get("jobs", []):
+                if not match(j.get("title",""), mots): continue
+                result.append(offre(
+                    f"gh_{j.get('id')}", j.get("title"), e["nom"],
+                    j.get("location",{}).get("name"), None, None, None,
+                    j.get("updated_at"), j.get("absolute_url"), f"Site carrière ({e['nom']})"
+                ))
+        except: pass
+    return result
 
-def adapter_cv(profil, offre, cv_original):
+# ══════════════════════════════════════════════
+# 🟡  WELCOME TO THE JUNGLE
+# ══════════════════════════════════════════════
+def scraper_wttj(mots: str = "", localisation: str = ""):
+    result = []
+    try:
+        params = {"query": mots, "page": 1, "per_page": 20}
+        if localisation: params["aroundQuery"] = localisation
+        r = requests.get("https://api.welcometothejungle.com/api/v1/jobs", params=params, headers=H_JSON, timeout=10)
+        if r.status_code == 200:
+            for j in r.json().get("jobs", []):
+                result.append(offre(
+                    f"wttj_{j.get('slug', j.get('id'))}", j.get("name"),
+                    j.get("organization",{}).get("name"), j.get("office",{}).get("city"),
+                    j.get("contract_type",{}).get("name"), None, j.get("description",""),
+                    j.get("published_at"),
+                    f"https://www.welcometothejungle.com/jobs/{j.get('slug')}",
+                    "Welcome to the Jungle", [s.get("name") for s in j.get("skills",[])]
+                ))
+    except: pass
+    return result
+
+# ══════════════════════════════════════════════
+# 🔴  SMARTRECRUITERS (API publique gratuite)
+# Slugs vérifiés sur careers.smartrecruiters.com
+# ══════════════════════════════════════════════
+def scraper_smartrecruiters(entreprises: list, mots: str = ""):
+    result = []
+    for e in entreprises:
+        try:
+            params = {"limit": 20, "offset": 0}
+            if mots: params["q"] = mots
+            r = requests.get(
+                f"https://api.smartrecruiters.com/v1/companies/{e['slug']}/postings",
+                params=params, headers=H_JSON, timeout=10
+            )
+            if r.status_code == 200:
+                for j in r.json().get("content", []):
+                    titre = j.get("name","")
+                    if not match(titre, mots): continue
+                    loc = j.get("location",{})
+                    lieu = ", ".join(filter(None, [loc.get("city"), loc.get("country")]))
+                    result.append(offre(
+                        f"sr_{j.get('id')}", titre, e["nom"],
+                        lieu or "Non précisé",
+                        j.get("typeOfEmployment",{}).get("label"),
+                        None, None, j.get("releasedDate"),
+                        f"https://jobs.smartrecruiters.com/{e['slug']}/{j.get('id')}",
+                        f"Site carrière ({e['nom']})"
+                    ))
+        except: pass
+    return result
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
+
+# ══════════════════════════════════════════════
+# 🟠  WORKDAY (API JSON publique)
+# Tenants vérifiés sur *.myworkdayjobs.com
+# ══════════════════════════════════════════════
+def scraper_workday_one(e: dict, mots: str = ""):
+    result = []
+    try:
+        # L'API Workday CXS est publique et retourne du JSON
+        url = f"https://{e['tenant']}.wd3.myworkdayjobs.com/wday/cxs/{e['tenant']}/{e['path']}/jobs"
+        payload = {"limit": 20, "offset": 0, "searchText": mots or ""}
+        r = requests.post(url, json=payload, headers={**H_JSON, "Content-Type": "application/json"}, timeout=12)
+        if r.status_code == 200:
+            for j in r.json().get("jobPostings", []):
+                titre = j.get("title","")
+                if not match(titre, mots): continue
+                external_path = j.get("externalPath","")
+                result.append(offre(
+                    f"wd_{e['nom'].replace(' ','_')}_{external_path.replace('/','_')}",
+                    titre, e["nom"],
+                    j.get("locationsText","Non précisé"),
+                    None, None, None, j.get("postedOn"),
+                    f"https://{e['tenant']}.wd3.myworkdayjobs.com{external_path}",
+                    f"Site carrière ({e['nom']})"
+                ))
+    except: pass
+    return result
+
+def scraper_workday(entreprises: list, mots: str = ""):
+    result = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(scraper_workday_one, e, mots): e for e in entreprises}
+        for f in as_completed(futures):
+            try: result.extend(f.result())
+            except: pass
+    return result
+
+# ══════════════════════════════════════════════
+# 🔵  TALEO / ORACLE (portail propre HTML)
+# ══════════════════════════════════════════════
+def scraper_taleo_one(e: dict, mots: str = ""):
+    result = []
+    try:
+        url = f"https://sjobs.brassring.com/TGnewUI/Search/home/HomeWithPreLoad?partnerid={e['partner']}&siteid={e['site']}&type=search&JobReq={mots}"
+        r = requests.get(url, headers=H_BROWSER, timeout=12)
+        # Extraction simplifiée via regex des titres
+        titres = re.findall(r'class="jobTitle"[^>]*>([^<]+)<', r.text)
+        liens = re.findall(r'href="([^"]*JobReqDetail[^"]*)"', r.text)
+        for i, titre in enumerate(titres[:20]):
+            if not match(titre, mots): continue
+            lien = liens[i] if i < len(liens) else e.get("base_url","#")
+            result.append(offre(
+                f"taleo_{e['nom']}_{i}", titre.strip(), e["nom"],
+                e.get("pays","France"), None, None, None, None, lien,
+                f"Site carrière ({e['nom']})"
+            ))
+    except: pass
+    return result
+
+# ══════════════════════════════════════════════
+# 🟤  PORTAILS HTML PROPRES
+# Pour les entreprises sans ATS standard
+# ══════════════════════════════════════════════
+
+_robots_cache: dict = {}
+
+def robots_autorise(url: str) -> bool:
+    """Vérifie que le scraping est autorisé via robots.txt (mis en cache)."""
+    try:
+        from urllib.robotparser import RobotFileParser
+        from urllib.parse import urlparse
+        base = urlparse(url)
+        robots_url = f"{base.scheme}://{base.netloc}/robots.txt"
+        if robots_url not in _robots_cache:
+            rp = RobotFileParser()
+            rp.set_url(robots_url)
+            rp.read()
+            _robots_cache[robots_url] = rp
+        return _robots_cache[robots_url].can_fetch("*", url)
+    except Exception:
+        return True  # En cas d'erreur, on considère autorisé
+
+def scraper_html_one(e: dict, mots: str = ""):
+    """Scraper générique pour portails HTML avec BeautifulSoup"""
+    result = []
+    try:
+        if not robots_autorise(e["url"]):
+            print(f"[robots.txt] Scraping interdit pour {e['nom']} — ignoré")
+            return result
+        from bs4 import BeautifulSoup
+        r = requests.get(e["url"], headers=H_BROWSER, timeout=12)
+        soup = BeautifulSoup(r.text, "html.parser")
+        # Cherche les balises les plus communes pour les listes d'offres
+        selectors = e.get("selectors", ["h2", "h3", ".job-title", ".offer-title", ".position-title", "td a"])
+        titres_trouves = []
+        for sel in selectors:
+            titres_trouves = soup.select(sel)
+            if titres_trouves: break
+        for i, el in enumerate(titres_trouves[:20]):
+            titre = el.get_text(strip=True)
+            if not titre or len(titre) < 5: continue
+            if not match(titre, mots): continue
+            lien = el.get("href") or (el.find("a") and el.find("a").get("href")) or e["url"]
+            if lien and not lien.startswith("http"): lien = e.get("base_url","") + lien
+            result.append(offre(
+                f"html_{e['nom'].replace(' ','_')}_{i}", titre, e["nom"],
+                e.get("lieu","France"), None, None, None, None,
+                lien or e["url"], f"Site carrière ({e['nom']})"
+            ))
+    except: pass
+    return result
+
+def scraper_html(entreprises: list, mots: str = ""):
+    result = []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(scraper_html_one, e, mots): e for e in entreprises}
+        for f in as_completed(futures):
+            try: result.extend(f.result())
+            except: pass
+    return result
+
+# ══════════════════════════════════════════════
+# 📋  LISTE COMPLÈTE DES ENTREPRISES PAR ATS
+# ══════════════════════════════════════════════
+
+# ── LEVER (API publique gratuite) ──
+LEVER_ENTREPRISES = [
+    # Tech / FinTech
+    {"nom": "Mistral AI", "slug": "mistral"},
+    {"nom": "Qonto", "slug": "qonto"},
+    {"nom": "Pennylane", "slug": "pennylane"},
+    {"nom": "Swile", "slug": "swile"},
+    {"nom": "Contentsquare", "slug": "contentsquare"},
+    {"nom": "Dataiku", "slug": "dataiku"},
+    {"nom": "PayFit", "slug": "payfit"},
+    {"nom": "Spendesk", "slug": "spendesk"},
+    {"nom": "Aircall", "slug": "aircall"},
+    {"nom": "Ankorstore", "slug": "ankorstore"},
+    # Business Planning
+    {"nom": "Pigment", "slug": "pigment"},
+    # RH / Conseil
+    {"nom": "Randstad Digital", "slug": "randstaddigital"},
+    # Marketing
+    {"nom": "Ogury", "slug": "ogury"},
+]
+
+# ── GREENHOUSE (API publique gratuite) ──
+GREENHOUSE_ENTREPRISES = [
+    # Santé / Insurtech
+    {"nom": "Doctolib", "slug": "doctolib"},
+    {"nom": "Alma", "slug": "alma"},
+    # E-commerce / Marketplace
+    {"nom": "Back Market", "slug": "backmarket"},
+    {"nom": "Vestiaire Collective", "slug": "vestiairecollective"},
+    {"nom": "ManoMano", "slug": "manomano"},
+    {"nom": "Leboncoin", "slug": "adevintafrance"},
+    # Transport / Mobilité
+    {"nom": "BlaBlaCar", "slug": "blablacar"},
+    # Finance / Crypto
+    {"nom": "Ledger", "slug": "ledger"},
+    {"nom": "Younited", "slug": "younited"},
+    {"nom": "iBanFirst", "slug": "ibanfirst"},
+    # AdTech
+    {"nom": "Teads", "slug": "teads1"},
+    # Conseil / ESN
+    {"nom": "Capgemini", "slug": "capgemini"},
+    {"nom": "Sopra Steria", "slug": "soprasteria"},
+]
+
+# ── SMARTRECRUITERS (API publique gratuite) ──
+# Slugs vérifiés sur careers.smartrecruiters.com/<slug>
+SMARTRECRUITERS_ENTREPRISES = [
+    # Distribution / Retail
+    {"nom": "Decathlon", "slug": "DECATHLON"},
+    {"nom": "Leroy Merlin", "slug": "LeroyMerlinFrance"},
+    {"nom": "Carrefour", "slug": "Carrefour"},
+    {"nom": "Fnac Darty", "slug": "FnacDarty"},
+    {"nom": "Cdiscount", "slug": "Cdiscount"},
+    # Luxe / Mode / Beauté
+    {"nom": "LVMH Perfumes & Cosmetics", "slug": "LVMHPerfumesCosmetics"},
+    {"nom": "Kering", "slug": "Kering"},
+    {"nom": "Sephora", "slug": "Sephora"},
+    # Finance / Banque / Assurance
+    {"nom": "BNP Paribas", "slug": "BNPParibas"},
+    {"nom": "AXA", "slug": "AXA"},
+    {"nom": "Société Générale", "slug": "SocieteGenerale"},
+    {"nom": "Crédit Agricole", "slug": "CreditAgricole"},
+    # Energie / Industrie
+    {"nom": "Engie", "slug": "ENGIE"},
+    {"nom": "Veolia", "slug": "Veolia"},
+    # BTP / Construction
+    {"nom": "Vinci", "slug": "Vinci"},
+    {"nom": "Bouygues", "slug": "Bouygues"},
+    {"nom": "Saint-Gobain", "slug": "SaintGobain"},
+    # Télécoms
+    {"nom": "Orange", "slug": "Orange"},
+    {"nom": "SFR", "slug": "SFR"},
+    # Conseil / Audit
+    {"nom": "Accenture", "slug": "Accenture"},
+    {"nom": "Deloitte France", "slug": "DeloitteFrance"},
+    {"nom": "PwC France", "slug": "PwCFrance"},
+    # Agroalimentaire
+    {"nom": "Danone", "slug": "Danone"},
+    {"nom": "Pernod Ricard", "slug": "PernodRicard"},
+    # RH / Interim
+    {"nom": "Adecco", "slug": "Adecco"},
+    {"nom": "Manpower", "slug": "ManpowerGroup"},
+    # Santé / Pharma
+    {"nom": "Sanofi", "slug": "Sanofi"},
+    {"nom": "Ipsen", "slug": "Ipsen"},
+    # Transport / Logistique
+    {"nom": "XPO Logistics", "slug": "XPOLogistics"},
+    {"nom": "Geodis", "slug": "Geodis"},
+    # Immobilier
+    {"nom": "Nexity", "slug": "Nexity"},
+    {"nom": "Icade", "slug": "Icade"},
+    # Hôtellerie / Restauration
+    {"nom": "Sodexo", "slug": "Sodexo"},
+    {"nom": "Compass Group", "slug": "CompassGroup"},
+    # Tech / ESN
+    {"nom": "Thales", "slug": "Thales"},
+    {"nom": "Atos", "slug": "Atos"},
+    # Services / Propreté / Facility
+    {"nom": "Onet", "slug": "Onet"},
+    {"nom": "ISS France", "slug": "ISSFrance"},
+    {"nom": "Elior", "slug": "Elior"},
+    {"nom": "Elis", "slug": "Elis"},
+    # Grande distribution alimentaire
+    {"nom": "Casino", "slug": "CasinoGroup"},
+    {"nom": "Picard", "slug": "Picard"},
+    # Santé / Médico-social
+    {"nom": "Korian", "slug": "Korian"},
+    {"nom": "Orpea", "slug": "Orpea"},
+    {"nom": "Ramsay Santé", "slug": "RamsaySante"},
+    {"nom": "Elsan", "slug": "Elsan"},
+    # Transport / Mobilité
+    {"nom": "Transdev", "slug": "Transdev"},
+    {"nom": "Keolis", "slug": "Keolis"},
+    {"nom": "DB Schenker France", "slug": "DBSchenker"},
+    # RH / Interim supplémentaires
+    {"nom": "Randstad France", "slug": "RandstadFrance"},
+    {"nom": "Synergie", "slug": "Synergie"},
+    {"nom": "Proman", "slug": "Proman"},
+    # Assurance supplémentaire
+    {"nom": "Groupama", "slug": "Groupama"},
+    {"nom": "Allianz France", "slug": "AllianzFrance"},
+    {"nom": "Generali France", "slug": "GeneraliFrance"},
+    # Distribution spécialisée
+    {"nom": "Kiloutou", "slug": "Kiloutou"},
+    {"nom": "Norauto", "slug": "Norauto"},
+    # Hôtellerie / Restauration
+    {"nom": "Marriott France", "slug": "Marriott"},
+    {"nom": "Hyatt France", "slug": "Hyatt"},
+    {"nom": "Courtepaille", "slug": "Courtepaille"},
+    # LegalTech
+    {"nom": "Legalstart", "slug": "Legalstart"},
+]
+
+# ── WORKDAY (API JSON publique — tenant + path vérifiés) ──
+WORKDAY_ENTREPRISES = [
+    # Beauté / Cosmétique
+    {"nom": "L'Oréal", "tenant": "loreal", "path": "Careers"},
+    # Industrie / Aéronautique
+    {"nom": "Airbus", "tenant": "airbus", "path": "Airbus"},
+    {"nom": "Schneider Electric", "tenant": "schneider", "path": "Schneider_Electric_Careers"},
+    {"nom": "Safran", "tenant": "safran", "path": "Safran"},
+    {"nom": "Michelin", "tenant": "michelin", "path": "Michelin_Jobs"},
+    # Energie
+    {"nom": "TotalEnergies", "tenant": "totalenergies", "path": "TotalEnergies"},
+    {"nom": "EDF", "tenant": "edf", "path": "EDF"},
+    # Luxe
+    {"nom": "Hermès", "tenant": "hermes", "path": "Hermes"},
+    # Hôtellerie
+    {"nom": "Accor", "tenant": "accor", "path": "Accor_Careers"},
+    # Automobile
+    {"nom": "Renault", "tenant": "renault", "path": "Renault_Group"},
+    {"nom": "Stellantis", "tenant": "stellantis", "path": "Stellantis"},
+    # Distribution
+    {"nom": "Auchan", "tenant": "auchan", "path": "Auchan_Careers"},
+    # Conseil / IT
+    {"nom": "Publicis", "tenant": "publicis", "path": "Publicis_Groupe"},
+    {"nom": "Dassault Systèmes", "tenant": "dassault", "path": "DassaultSystemes"},
+    # Finance
+    {"nom": "Amundi", "tenant": "amundi", "path": "Amundi"},
+    # Services / RH
+    {"nom": "Adecco Group", "tenant": "adeccogroup", "path": "AdeccoGroup"},
+    {"nom": "Manpower Group", "tenant": "manpowergroup", "path": "ManpowerGroup"},
+    {"nom": "Bureau Veritas", "tenant": "bureauveritas", "path": "BureauVeritas"},
+    # Retail / Distribution
+    {"nom": "Leroy Merlin (WD)", "tenant": "leroymerlin", "path": "LeroyMerlin"},
+    {"nom": "Fnac Darty (WD)", "tenant": "fnacdarty", "path": "FnacDarty"},
+    # Santé
+    {"nom": "Sanofi (WD)", "tenant": "sanofi", "path": "Sanofi"},
+    {"nom": "bioMérieux", "tenant": "biomerieux", "path": "bioMerieux"},
+    # Industrie
+    {"nom": "Plastic Omnium", "tenant": "plasticomnium", "path": "PlasticOmnium"},
+    {"nom": "Eiffage", "tenant": "eiffage", "path": "Eiffage"},
+    {"nom": "Air Liquide", "tenant": "airliquidehr", "path": "AirLiquideExternalCareer"},
+]
+
+# ── PORTAILS HTML PROPRES ──
+# Pour les entreprises sans ATS standard ou avec portail maison
+HTML_ENTREPRISES = [
+    {
+        "nom": "Intermarché / Les Mousquetaires",
+        "url": "https://recrutement.mousquetaires.com/nos-offres/",
+        "base_url": "https://recrutement.mousquetaires.com",
+        "selectors": [".job-title", "h3 a", ".offer__title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "E.Leclerc",
+        "url": "https://www.e-leclerc.com/recrutement",
+        "base_url": "https://www.e-leclerc.com",
+        "selectors": [".job-title", "h3 a"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Lidl France",
+        "url": "https://careers.lidl.fr/fr/offres-d-emploi",
+        "base_url": "https://careers.lidl.fr",
+        "selectors": [".job-title", "h3", ".vacancy-title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Aldi France",
+        "url": "https://recrutement.aldi.fr/offres-d-emploi",
+        "base_url": "https://recrutement.aldi.fr",
+        "selectors": [".job-title", "h2", ".offer-title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "SNCF",
+        "url": "https://www.sncf.com/fr/recrutement/offres-emploi",
+        "base_url": "https://www.sncf.com",
+        "selectors": [".offer-title", "h3 a", ".job-item__title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Air France",
+        "url": "https://recrutement.airfranceklm.com/nos-offres",
+        "base_url": "https://recrutement.airfranceklm.com",
+        "selectors": [".vacancy-title", "h3", ".job-title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "La Poste",
+        "url": "https://recrutement.laposte.fr/nos-offres-d-emploi",
+        "base_url": "https://recrutement.laposte.fr",
+        "selectors": [".offer__title", "h3 a", ".job-title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Crédit Mutuel",
+        "url": "https://www.creditmutuel.fr/fr/vous/rejoignez-nous/nos-offres.html",
+        "base_url": "https://www.creditmutuel.fr",
+        "selectors": ["h3 a", ".offer-title", "td a"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Havas",
+        "url": "https://havas.com/fr/carrieres/nos-offres-demploi/",
+        "base_url": "https://havas.com",
+        "selectors": [".job-title", "h3 a", ".career-item__title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Chronopost / DPD",
+        "url": "https://www.dpd.com/fr/fr/carrieres/offres-d-emploi/",
+        "base_url": "https://www.dpd.com",
+        "selectors": [".job-title", "h3 a"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Boursorama Banque",
+        "url": "https://recrutement.boursobank.com/offres",
+        "base_url": "https://recrutement.boursobank.com",
+        "selectors": [".offer-title", "h3", ".job-title"],
+        "lieu": "France"
+    },
+    {
+        "nom": "Leclerc / CDM",
+        "url": "https://www.mouvement-leclerc.com/recrutement/offres-emploi",
+        "base_url": "https://www.mouvement-leclerc.com",
+        "selectors": ["h3 a", ".job-offer__title"],
+        "lieu": "France"
+    },
+]
+
+# ── ASHBY (API JSON publique — startups tech FR) ──
+# Slugs 100% vérifiés sur jobs.ashbyhq.com
+ASHBY_ENTREPRISES = [
+    {"nom": "Alan", "slug": "alan"},
+    {"nom": "Joko", "slug": "joko"},
+]
+
+# ── PERSONIO (XML public — PME/ETI françaises) ──
+# Slugs vérifiés sur {company}.jobs.personio.de
+# Luko supprimée (liquidée 2023, reprise Allianz)
+# Meero supprimée (restructuration massive 2022, recrutements quasi nuls)
+PERSONIO_ENTREPRISES = [
+    {"nom": "Agicap", "company": "agicap"},
+    {"nom": "Pricemoov", "company": "pricemoov"},
+    {"nom": "Libeo", "company": "libeo"},
+    {"nom": "Payplug", "company": "payplug"},
+    {"nom": "Scality", "company": "scality"},
+    {"nom": "Sendinblue", "company": "sendinblue"},
+    {"nom": "Livestorm", "company": "livestorm"},
+    {"nom": "Wimi", "company": "wimi"},
+    {"nom": "Botify", "company": "botify"},
+    {"nom": "Spendesk", "company": "spendesk"},
+    {"nom": "Partoo", "company": "partoo"},
+    {"nom": "Getfluence", "company": "getfluence"},
+    {"nom": "Sociabble", "company": "sociabble"},
+]
+
+# ══════════════════════════════════════════════
+# 🟣  ASHBY (API JSON publique, aucune auth)
+# ══════════════════════════════════════════════
+def scraper_ashby_one(e: dict, mots: str = "") -> list:
+    result = []
+    try:
+        url = f"https://api.ashbyhq.com/posting-api/job-board/{e['slug']}"
+        r = requests.get(url, headers=H_JSON, timeout=10)
+        if r.status_code != 200:
+            return result
+        for j in r.json().get("jobs", []):
+            if not j.get("isListed", True):
+                continue
+            titre = j.get("title", "")
+            if not match(titre, mots):
+                continue
+            loc = j.get("location", "") or ""
+            addr = j.get("address", {}).get("postalAddress", {})
+            lieu = loc or ", ".join(filter(None, [
+                addr.get("addressLocality"), addr.get("addressCountry")
+            ])) or "Non précisé"
+            result.append(offre(
+                f"ashby_{j.get('id', titre)}", titre, e["nom"],
+                lieu,
+                j.get("employmentType", "").replace("FullTime", "CDI").replace("Intern", "Stage").replace("Contract", "CDD"),
+                None, j.get("descriptionPlain", ""),
+                j.get("publishedAt"), j.get("jobUrl"), f"Site carrière ({e['nom']})"
+            ))
+    except Exception:
+        pass
+    return result
+
+def scraper_ashby(entreprises: list, mots: str = "") -> list:
+    result = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(scraper_ashby_one, e, mots): e for e in entreprises}
+        for f in as_completed(futures):
+            try:
+                result.extend(f.result())
+            except Exception:
+                pass
+    return result
+
+# ══════════════════════════════════════════════
+# 🟤  PERSONIO (XML public par entreprise)
+# ══════════════════════════════════════════════
+def scraper_personio_one(e: dict, mots: str = "") -> list:
+    result = []
+    try:
+        url = f"https://{e['company']}.jobs.personio.de/xml?language=fr"
+        r = requests.get(url, headers=H_BROWSER, timeout=10)
+        if r.status_code != 200:
+            return result
+        root = ET.fromstring(r.content)
+        for pos in root.findall(".//position"):
+            titre = (pos.findtext("name") or "").strip()
+            if not titre or not match(titre, mots):
+                continue
+            lieu = (pos.findtext("office") or pos.findtext("location") or "Non précisé").strip()
+            contrat = (pos.findtext("schedule") or "").strip()
+            desc = (pos.findtext("jobDescriptions/jobDescription/value") or "").strip()
+            job_id = pos.findtext("id") or titre
+            url_offre = f"https://{e['company']}.jobs.personio.de/job/{job_id}"
+            result.append(offre(
+                f"personio_{e['company']}_{job_id}", titre, e["nom"],
+                lieu, contrat, None, desc,
+                pos.findtext("createdAt") or None,
+                url_offre, f"Site carrière ({e['nom']})"
+            ))
+    except Exception:
+        pass
+    return result
+
+def scraper_personio(entreprises: list, mots: str = "") -> list:
+    result = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(scraper_personio_one, e, mots): e for e in entreprises}
+        for f in as_completed(futures):
+            try:
+                result.extend(f.result())
+            except Exception:
+                pass
+    return result
+
+# ══════════════════════════════════════════════
+# 🟢  LA BONNE ALTERNANCE (API beta.gouv — alternance/stage)
+# Nécessite LBA_API_KEY — usage non lucratif uniquement
+# ══════════════════════════════════════════════
+# Mapping villes → coordonnées (lat, lon) pour La Bonne Alternance
+LBA_COORDS = {
+    "paris": (48.8566, 2.3522), "marseille": (43.2965, 5.3698),
+    "lyon": (45.7640, 4.8357), "toulouse": (43.6047, 1.4442),
+    "nice": (43.7102, 7.2620), "nantes": (47.2184, -1.5536),
+    "bordeaux": (44.8378, -0.5792), "lille": (50.6292, 3.0573),
+    "montpellier": (43.6108, 3.8767), "strasbourg": (48.5734, 7.7521),
+    "rennes": (48.1173, -1.6778), "grenoble": (45.1885, 5.7245),
+    "aix-en-provence": (43.5297, 5.4474), "toulon": (43.1242, 5.9280),
+    "dijon": (47.3220, 5.0415), "angers": (47.4784, -0.5632),
+    "reims": (49.2583, 4.0317), "le mans": (47.9960, 0.1966),
+    "clermont-ferrand": (45.7797, 3.0863), "brest": (48.3904, -4.4861),
+    "amiens": (49.8941, 2.2957), "rouen": (49.4432, 1.0993),
+    "caen": (49.1829, -0.3707), "nancy": (48.6921, 6.1844),
+    "metz": (49.1193, 6.1757), "tours": (47.3941, 0.6848),
+}
+
+def scraper_lba(mots: str = "", localisation: str = "", contrat: str = "") -> list:
+    """La Bonne Alternance — uniquement pour contrats alternance/stage"""
+    if not LBA_API_KEY:
+        return []
+    # On ne lance LBA que si le type de contrat est alternance/stage ou non précisé
+    contrat_lower = (contrat or "").lower()
+    if contrat_lower and contrat_lower not in ("", "al", "st", "alternance", "stage", "apprentissage"):
+        return []
+    result = []
+    try:
+        headers = {"Authorization": f"Bearer {LBA_API_KEY}", "Accept": "application/json"}
+        params = {"caller": "jobalert"}
+        # Géolocalisation
+        ville_norm = (localisation or "").lower().strip()
+        import unicodedata, re as _re
+        def norm_ville(s):
+            s = unicodedata.normalize("NFD", s)
+            s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+            return _re.sub(r"[-'_]", " ", s.lower()).strip()
+        ville_key = norm_ville(localisation) if localisation else ""
+        coords = LBA_COORDS.get(ville_key)
+        if coords:
+            params["latitude"] = coords[0]
+            params["longitude"] = coords[1]
+            params["radius"] = 30
+        r = requests.get(
+            "https://api.apprentissage.beta.gouv.fr/api/job/v1/search",
+            headers=headers, params=params, timeout=15
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        # Offres LBA directes
+        for j in data.get("jobs", [])[:30]:
+            titre = (j.get("offer", {}).get("title") or "").strip()
+            if not titre or not match(titre, mots):
+                continue
+            workplace = j.get("workplace", {})
+            contract = j.get("contract", {})
+            contrat_type = contract.get("type") or "Alternance"
+            lieu = workplace.get("location", {}).get("label") or workplace.get("name") or "Non précisé"
+            desc = j.get("offer", {}).get("description", "")
+            apply_url = j.get("apply", {}).get("url") or "#"
+            job_id = j.get("identifier", {}).get("partner_job_id") or titre[:20]
+            result.append(offre(
+                f"lba_{job_id}", titre,
+                workplace.get("name", "Non précisé"), lieu,
+                contrat_type,
+                None, desc,
+                j.get("contract", {}).get("start") or None,
+                apply_url, "La Bonne Alternance"
+            ))
+    except Exception:
+        pass
+    return result
+
+# ══════════════════════════════════════════════
+# 🚀  SCRAPER PRINCIPAL (parallélisé)
+# ══════════════════════════════════════════════
+# Timeout individuel par scraper (secondes)
+SCRAPER_TIMEOUTS = {
+    "Lever": 10, "Greenhouse": 10, "SmartRecruiters": 12,
+    "Workday": 12, "Welcome to the Jungle": 10, "Portails HTML": 10,
+    "Ashby": 10, "Personio": 10, "La Bonne Alternance": 12,
+}
+
+def scraper_tous(mots: str = "", localisation: str = "", type_contrat: str = ""):
+    """Lance tous les scrapers en parallèle — timeout individuel par source — résultats partiels si timeout"""
+    toutes = []
+    erreurs = []
+    sources_ok = []
+    sources_timeout = []
+
+    scrapers = [
+        ("Lever", lambda: scraper_lever(LEVER_ENTREPRISES, mots)),
+        ("Greenhouse", lambda: scraper_greenhouse(GREENHOUSE_ENTREPRISES, mots)),
+        ("SmartRecruiters", lambda: scraper_smartrecruiters(SMARTRECRUITERS_ENTREPRISES, mots)),
+        ("Workday", lambda: scraper_workday(WORKDAY_ENTREPRISES, mots)),
+        ("Welcome to the Jungle", lambda: scraper_wttj(mots, localisation)),
+        ("Portails HTML", lambda: scraper_html(HTML_ENTREPRISES, mots)),
+        ("Ashby", lambda: scraper_ashby(ASHBY_ENTREPRISES, mots)),
+        ("Personio", lambda: scraper_personio(PERSONIO_ENTREPRISES, mots)),
+        ("La Bonne Alternance", lambda: scraper_lba(mots, localisation, type_contrat)),
+    ]
+
+    with ThreadPoolExecutor(max_workers=9) as ex:
+        futures = {ex.submit(fn): nom for nom, fn in scrapers}
+        try:
+            completed = as_completed(futures, timeout=45)
+            for future in completed:
+                nom = futures[future]
+                try:
+                    res = future.result(timeout=0.1)
+                    toutes.extend(res)
+                    sources_ok.append(f"{nom}:{len(res)}")
+                except FuturesTimeoutError:
+                    sources_timeout.append(nom)
+                    erreurs.append(f"{nom}: timeout")
+                except Exception as e:
+                    erreurs.append(f"{nom}: {str(e)[:80]}")
+        except FuturesTimeoutError:
+            # Récupérer les résultats déjà complétés
+            for future, nom in futures.items():
+                if future.done():
+                    try:
+                        res = future.result()
+                        toutes.extend(res)
+                        sources_ok.append(f"{nom}:{len(res)}")
+                    except Exception as e:
+                        erreurs.append(f"{nom}: {str(e)[:80]}")
+                else:
+                    sources_timeout.append(nom)
+                    future.cancel()
+
+    if sources_timeout:
+        print(f"[TIMEOUT] Sources lentes ignorées: {', '.join(sources_timeout)}")
+
+    # Dédoublonnage par titre + entreprise
+    seen = set()
+    dedup = []
+    for o in toutes:
+        key = (o["titre"].lower().strip(), o["entreprise"].lower().strip())
+        if key not in seen:
+            seen.add(key)
+            dedup.append(o)
+
+    return dedup, erreurs
+
+# ══════════════════════════════════════════════
+# 🤖  IA
+# ══════════════════════════════════════════════
+def analyser_cv(texte: str):
     client = get_openai_client()
+<<<<<<< HEAD
     prompt = f"""Adapte ce CV pour cette offre.
 OFFRE: {offre.get('titre')} chez {offre.get('entreprise')} - {offre.get('description','')[:300]}
 CV: {cv_original}
 Retourne le CV adapté directement."""
-    r = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.3)
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        timeout=OPENAI_TIMEOUT_SEC,
+=======
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f"""Analyse ce CV et retourne uniquement un JSON strict :
+{{"nom":"","email":"","telephone":"","competences":[],"secteurs":[],"annees_experience":0,"dernier_poste":"","formation":"","langues":[],"resume_profil":""}}
+CV: {texte[:4000]}"""}],
+        temperature=0.1, response_format={"type": "json_object"}
+    )
+    return json.loads(r.choices[0].message.content)
+
+# Cache des variantes de postes pour éviter les appels GPT répétés
+_cache_variantes = {}
+
+def expand_mots_cles(poste: str) -> list:
+    """Génère toutes les variantes/synonymes du poste via GPT — mis en cache"""
+    if not poste: return [poste]
+    key = poste.lower().strip()
+    if key in _cache_variantes:
+        return _cache_variantes[key]
+    try:
+        client = get_openai_client()
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": f"""Tu es un expert du marché de l'emploi français.
+Pour le domaine/poste "{poste}", génère toutes les appellations et variantes de postes couramment utilisées dans les offres d'emploi françaises.
+Réponds UNIQUEMENT avec un JSON strict : {{"variantes": ["variante1", "variante2", ...]}}
+Inclus : abréviations (RRH, DRH...), appellations longues, niveaux (assistant, chargé, responsable, directeur...), synonymes sectoriels.
+Maximum 20 variantes pertinentes."""}],
+            temperature=0.1, response_format={"type": "json_object"}
+        )
+        data = json.loads(r.choices[0].message.content)
+        variantes = data.get("variantes", [poste])
+        # Toujours inclure le terme original
+        if poste.lower() not in [v.lower() for v in variantes]:
+            variantes.insert(0, poste)
+        _cache_variantes[key] = variantes
+        return variantes
+    except:
+        return [poste]
+
+def scorer(profil: dict, o: dict):
+    client = get_openai_client()
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f"""Tu es un expert RH. Évalue la compatibilité entre ce profil et cette offre d'emploi.
+Réponds UNIQUEMENT en JSON strict :
+{{"score":75,"points_forts":["raison 1","raison 2"],"points_faibles":["manque 1"],"recommandation":"conseil court"}}
+
+RÈGLES DE SCORING :
+- Le score évalue UNIQUEMENT la compatibilité profil ↔ compétences requises du poste
+- Base-toi sur : niveau d'expérience, formation, compétences, dernier poste
+- Un score > 80 = profil très solide pour ce type de poste
+- Un score < 50 = profil clairement inadapté aux exigences du poste
+- Sois précis et objectif, pas complaisant
+
+PROFIL : {profil.get("nom","")} | {profil.get("annees_experience",0)} ans exp. | Dernier poste : {profil.get("dernier_poste","")} | Formation : {profil.get("formation","")} | Compétences : {", ".join(profil.get("competences",[])[:10])} | {profil.get("resume_profil","")[:200]}
+OFFRE : {o.get("titre","")} chez {o.get("entreprise","")} | {o.get("description","")[:500]}"""}],
+        temperature=0.1, response_format={"type": "json_object"}
+    )
+    return json.loads(r.choices[0].message.content)
+
+
+def adapter_lettre(profil: dict, o: dict, lm_base: str):
+    """Adapte la LM personnelle de l'utilisateur à l'offre spécifique"""
+    client = get_openai_client()
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f"""Tu es expert RH. Adapte cette lettre de motivation personnelle pour ce poste précis.
+RÈGLES STRICTES :
+- Conserve le style, le ton et la voix de l'auteur (ne la réécris pas de zéro)
+- Remplace les références génériques par des éléments spécifiques à l'entreprise et au poste
+- Intègre naturellement les mots-clés de l'offre
+- Garde la même longueur approximative
+- Renforce l'accroche en mentionnant l'entreprise par son nom
+- Retourne uniquement la lettre adaptée, sans commentaire ni titre
+
+POSTE : {o.get('titre')} chez {o.get('entreprise')}
+DESCRIPTION OFFRE : {o.get('description','')[:400]}
+PROFIL : {profil.get('resume_profil','')} — {profil.get('annees_experience',0)} ans exp.
+
+LETTRE DE BASE DE L'UTILISATEUR :
+{lm_base[:2500]}"""}],
+        temperature=0.4
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
+    )
     return r.choices[0].message.content
 
-def generer_lettre_motivation(profil, offre):
+def generer_lettre(profil: dict, o: dict):
+    """Génère une LM depuis zéro si l'utilisateur n'en a pas fourni"""
     client = get_openai_client()
+<<<<<<< HEAD
     prompt = f"""Rédige une lettre de motivation (250-350 mots) pour ce poste.
 Poste: {offre.get('titre')} chez {offre.get('entreprise')}
 Description: {offre.get('description','')[:300]}
 Profil: {profil.get('resume_profil','')}
 Commence par une accroche mentionnant l'entreprise. Ton professionnel mais humain."""
-    r = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.7)
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+        timeout=OPENAI_TIMEOUT_SEC,
+    )
     return r.choices[0].message.content
 
+# ─── Cache léger (réduire coût API / OpenAI, sans Redis = tu restes propriétaire) ───
+_cache_offres: dict[str, tuple[list, float]] = {}
+_cache_scorer: dict[str, tuple[dict, float]] = {}
+_cache_lock = Lock()
+
+def _cache_get(cache: dict, key: str, ttl_sec: int) -> tuple[Optional[Any], bool]:
+    with _cache_lock:
+        if key not in cache:
+            return None, False
+        data, ts = cache[key]
+        if (datetime.now(timezone.utc).timestamp() - ts) > ttl_sec:
+            del cache[key]
+            return None, False
+        return data, True
+
+def _cache_set(cache: dict, key: str, data: any):
+    with _cache_lock:
+        cache[key] = (data, datetime.now(timezone.utc).timestamp())
+
 # ─── ROUTES PUBLIQUES ───
+=======
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f"""Rédige une lettre de motivation percutante (300-400 mots) pour ce poste.
+Poste: {o.get('titre')} chez {o.get('entreprise')}
+Description: {o.get('description','')[:400]}
+Profil: {profil.get('resume_profil','')} — {profil.get('annees_experience',0)} ans — {', '.join(profil.get('competences',[])[:6])}
+Commence par une accroche forte mentionnant l'entreprise. Retourne uniquement la lettre."""}],
+        temperature=0.7
+    )
+    return r.choices[0].message.content
+
+
+
+def generer_pdf_lm(texte_lm: str, titre_offre: str = "", entreprise: str = "", nom_candidat: str = "") -> bytes:
+    """Génère un PDF propre de la lettre de motivation"""
+    import pymupdf
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)  # A4
+    mx, my = 70, 70
+    y = my
+    if nom_candidat:
+        page.insert_text((mx, y), nom_candidat, fontsize=13, fontname="helv", color=(0.1, 0.1, 0.4))
+        y += 22
+    if entreprise or titre_offre:
+        label = f"Candidature : {titre_offre}" + (f" — {entreprise}" if entreprise else "")
+        page.insert_text((mx, y), label, fontsize=10, fontname="helv", color=(0.4, 0.4, 0.4))
+        y += 16
+    from datetime import date
+    page.insert_text((mx, y), f"Le {date.today().strftime('%d/%m/%Y')}", fontsize=10, fontname="helv", color=(0.4,0.4,0.4))
+    y += 30
+    page.draw_line((mx, y), (595 - mx, y), color=(0.8, 0.8, 0.8), width=0.5)
+    y += 20
+    for paragraphe in texte_lm.split("\n"):
+        if not paragraphe.strip():
+            y += 10
+            continue
+        mots = paragraphe.split(" ")
+        ligne = ""
+        for mot in mots:
+            test = ligne + (" " if ligne else "") + mot
+            if len(test) > 90:
+                page.insert_text((mx, y), ligne, fontsize=11, fontname="helv", color=(0,0,0))
+                y += 16
+                ligne = mot
+                if y > 800:
+                    page = doc.new_page(width=595, height=842)
+                    y = my
+            else:
+                ligne = test
+        if ligne:
+            page.insert_text((mx, y), ligne, fontsize=11, fontname="helv", color=(0,0,0))
+            y += 16
+        if y > 800:
+            page = doc.new_page(width=595, height=842)
+            y = my
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    return pdf_bytes
+
+
+def charger_user(user_id: str) -> dict:
+    """Charge les données depuis Supabase — fallback fichier local si Supabase indisponible"""
+    default = {"profil": {}, "criteres": {}, "favoris": [], "candidatures": [], "cv_texte": "", "cv_base64": "", "alerte_email": {}, "lm_base": ""}
+    try:
+        if SUPABASE_URL and SUPABASE_ANON_KEY:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/user_data?user_id=eq.{user_id}&select=*",
+                headers=supabase_headers(), timeout=5
+            )
+            if r.status_code == 200 and r.json():
+                data = r.json()[0].get("data", {})
+                for k, v in default.items():
+                    data.setdefault(k, v)
+                return data
+        # Fallback fichier local
+        f = f"data_{user_id}.json"
+        if os.path.exists(f):
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            for k, v in default.items():
+                data.setdefault(k, v)
+            return data
+        return default
+    except Exception as e:
+        print(f"[charger_user] Erreur: {e}")
+        return default
+
+def sauver_user(user_id: str, data: dict):
+    """Sauvegarde dans Supabase — fallback fichier local"""
+    try:
+        if SUPABASE_URL and SUPABASE_ANON_KEY:
+            # Upsert dans Supabase
+            r = requests.post(
+                f"{SUPABASE_URL}/rest/v1/user_data",
+                headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                json={"user_id": user_id, "data": data},
+                timeout=5
+            )
+            if r.status_code in (200, 201, 204):
+                return
+            print(f"[sauver_user] Supabase erreur {r.status_code}: {r.text[:100]}")
+        # Fallback fichier local
+        with open(f"data_{user_id}.json", "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[sauver_user] Erreur: {e}")
+        # Dernier recours
+        with open(f"data_{user_id}.json", "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+
+# ══════════════════════════════════════════════
+# 🌐  ROUTES API
+# ══════════════════════════════════════════════
+
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 @app.get("/")
 def root():
-    return {"message": "JobAlert IA API — En ligne ✅"}
+    return {"message": "JobAlert IA API v9.0 — En ligne ✅", "sources": ["France Travail", "Lever", "Greenhouse", "SmartRecruiters", "Workday", "Welcome to the Jungle", "Ashby", "Personio", "La Bonne Alternance", "Portails HTML"]}
+
+@app.get("/debug/smtp")
+def debug_smtp():
+    return {
+        "SMTP_HOST": SMTP_HOST or "❌ VIDE",
+        "SMTP_PORT": SMTP_PORT,
+        "SMTP_USER": SMTP_USER or "❌ VIDE",
+        "SMTP_PASS": "✅ défini" if SMTP_PASS else "❌ VIDE",
+        "SMTP_FROM": SMTP_FROM or "❌ VIDE",
+        "smtp_ok": bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
+    }
+
+@app.get("/debug/ft")
+def debug_ft():
+    """Route de debug pour tester France Travail — teste plusieurs formats de commune"""
+    try:
+        token = get_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        resultats_tests = {}
+        # Test 1 : sans localisation (pour vérifier que le token marche)
+        r0 = requests.get("https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search",
+            headers=headers, params={"motsCles": "RH", "range": "0-4"}, timeout=15)
+        resultats_tests["sans_localisation"] = {"status": r0.status_code, "nb": len(r0.json().get("resultats",[])), "erreur": r0.json().get("message")}
+        # Test 2 : avec departement=13
+        r1 = requests.get("https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search",
+            headers=headers, params={"motsCles": "RH", "departement": "13", "range": "0-49"}, timeout=15)
+        d1 = r1.json()
+        resultats_tests["departement_13"] = {"status": r1.status_code, "nb": len(d1.get("resultats",[])), "erreur": d1.get("message"), "exemple": d1.get("resultats",[{}])[0].get("intitule","—") if d1.get("resultats") else "aucun"}
+        # Test 3 : avec commune=13055 (code INSEE)
+        r2 = requests.get("https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search",
+            headers=headers, params={"motsCles": "RH", "commune": "13055", "range": "0-4"}, timeout=15)
+        resultats_tests["commune_insee_13055"] = {"status": r2.status_code, "nb": len(r2.json().get("resultats",[])), "erreur": r2.json().get("message")}
+        # Test 4 : avec lieuTravail.commune (format différent)
+        r3 = requests.get("https://api.francetravail.io/partenaire/offresdemploi/v2/offres/search",
+            headers=headers, params={"motsCles": "RH", "commune": "13", "range": "0-4"}, timeout=15)
+        resultats_tests["commune_dept_13"] = {"status": r3.status_code, "nb": len(r3.json().get("resultats",[])), "erreur": r3.json().get("message")}
+        return resultats_tests
+    except Exception as e:
+        return {"erreur": str(e)}
+
+@app.get("/debug/lba")
+def debug_lba():
+    """Test La Bonne Alternance — vérifie le token et retourne quelques offres (API v2)"""
+    try:
+        headers = {"Authorization": f"Bearer {LBA_API_KEY}", "Accept": "application/json"}
+        r = requests.get(
+            "https://api.apprentissage.beta.gouv.fr/api/job/v1/search",
+            headers=headers,
+            params={
+                "latitude": 43.2965,
+                "longitude": 5.3698,
+                "radius": 30,
+                "sources": "offres_emploi_lba,offres_emploi_partenaires"
+            },
+            timeout=15
+        )
+        data = r.json() if r.ok else {}
+        jobs = data.get("jobs", [])
+        nb = len(jobs)
+        exemple = jobs[0].get("offer", {}).get("title", "—") if nb else "aucun"
+        return {"status": r.status_code, "nb_offres": nb, "exemple": exemple, "token_ok": r.ok}
+    except Exception as e:
+        return {"erreur": str(e)}
+
+@app.get("/debug/ashby")
+def debug_ashby():
+    """Test Ashby — retourne les offres Alan"""
+    try:
+        r = requests.get("https://api.ashbyhq.com/posting-api/job-board/alan", headers=H_JSON, timeout=10)
+        jobs = r.json().get("jobs", [])
+        return {"status": r.status_code, "nb_offres": len(jobs), "exemple": jobs[0].get("title", "—") if jobs else "aucun"}
+    except Exception as e:
+        return {"erreur": str(e)}
+
+@app.get("/debug/token")
+async def debug_token(request: Request):
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "): return {"erreur": "Pas de token"}
+    token = auth[7:]
+    try:
+        client = get_jwks_client()
+        if client:
+            sk = client.get_signing_key_from_jwt(token)
+            p = jwt.decode(token, sk.key, algorithms=["ES256","RS256"], audience="authenticated")
+            return {"statut": "OK ✅ (ES256)", "user_id": p.get("sub")}
+    except Exception as e1:
+        try:
+            p = jwt.decode(token, SUPABASE_JWT_SECRET.encode("utf-8"), algorithms=["HS256"], audience="authenticated")
+            return {"statut": "OK ✅ (HS256)", "user_id": p.get("sub")}
+        except Exception as e2:
+            return {"statut": "ERREUR ❌", "ES256": str(e1), "HS256": str(e2)}
+
+@app.get("/health")
+def health():
+    """Santé + mode stockage (pour déploiement sans config)."""
+    return {
+        "ok": True,
+        "storage": "supabase" if _use_supabase() else "json",
+        "auth_required": bool(SUPABASE_JWT_SECRET),
+    }
+
+# ─── Mise à jour plan (WordPress après paiement Stripe ou webhook Stripe) ───
+@app.post("/internal/set-premium")
+def internal_set_premium(body: SetPremiumBody, x_internal_secret: Optional[str] = Header(None, alias="X-Internal-Secret")):
+    """
+    Met à jour le plan d'un utilisateur (premium/free).
+    À appeler depuis WordPress après succès checkout Stripe.
+    Header requis : X-Internal-Secret = INTERNAL_SECRET (variable d'environnement).
+    """
+    if not INTERNAL_SECRET or x_internal_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Secret invalide")
+    if body.plan not in ("free", "premium"):
+        raise HTTPException(status_code=400, detail="plan doit être 'free' ou 'premium'")
+    set_user_plan(body.user_id, body.plan)
+    return {"success": True, "user_id": body.user_id, "plan": body.plan}
+
+@app.post("/webhooks/stripe")
+async def webhook_stripe(request: Request, stripe_signature: Optional[str] = Header(None, alias="Stripe-Signature")):
+    """
+    Webhook Stripe (optionnel). Si STRIPE_WEBHOOK_SECRET est défini, traite checkout.session.completed
+    et met à jour le plan. Dans l'événement, metadata ou client_reference_id doit contenir user_id (Supabase).
+    """
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=501, detail="Webhook Stripe non configuré")
+    body = await request.body()
+    if not stripe_signature:
+        raise HTTPException(status_code=400, detail="Stripe-Signature manquant")
+    try:
+        import stripe
+        event = stripe.Webhook.construct_event(body, stripe_signature, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Signature Stripe invalide: {e}")
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = (session.get("metadata") or {}).get("user_id") or session.get("client_reference_id")
+        if user_id:
+            set_user_plan(user_id, "premium")
+            return {"received": True}
+    if event["type"] in ("customer.subscription.updated", "customer.subscription.deleted"):
+        # Optionnel : mapper subscription à user_id (ex. via metadata ou table stripe_customer_id -> user_id)
+        pass
+    return {"received": True}
 
 @app.post("/cv/extraire")
+<<<<<<< HEAD
+async def extraire_cv(file: UploadFile = File(...), user=Depends(verifier_token)):
+    """Extrait le texte d'un PDF uploadé — authentification requise (anti-abus)."""
+=======
 async def extraire_cv(file: UploadFile = File(...)):
-    """Extrait le texte d'un PDF uploadé — public (pas de token requis)"""
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     try:
         import pymupdf
         contenu = await file.read()
+        if len(contenu) > MAX_PDF_BYTES:
+            raise HTTPException(status_code=400, detail=f"Fichier trop volumineux (max {MAX_PDF_BYTES // (1024*1024)} Mo)")
         doc = pymupdf.open(stream=contenu, filetype="pdf")
-        texte = ""
-        nb_pages = len(doc)
-        for page in doc:
-            texte += page.get_text()
+        texte = "".join(p.get_text() for p in doc)
+        nb = len(doc)
         doc.close()
-        if not texte.strip():
-            raise HTTPException(status_code=400, detail="Le PDF ne contient pas de texte extractible")
-        return {"success": True, "texte": texte.strip(), "pages": nb_pages}
+        if not texte.strip(): raise HTTPException(400, "PDF sans texte")
+        return {"success": True, "texte": texte.strip(), "pages": nb}
     except ImportError:
+<<<<<<< HEAD
         raise HTTPException(status_code=500, detail="pymupdf non installé")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -244,7 +1837,7 @@ async def extraire_cv(file: UploadFile = File(...)):
 @app.post("/offres/france-travail")
 def get_offres_ft(criteres: CriteresRecherche, user=Depends(verifier_token)):
     try:
-        offres = rechercher_offres(criteres.dict())
+        offres = rechercher_offres(criteres.model_dump())
         return {"success": True, "offres": offres, "total": len(offres)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -260,92 +1853,857 @@ def get_offres_ats(criteres: CriteresRecherche, user=Depends(verifier_token)):
 @app.post("/offres/toutes")
 def get_toutes_offres(criteres: CriteresRecherche, user=Depends(verifier_token)):
     """
-    Retourne les offres France Travail + ATS.
-    Chaque source est isolée : si l'une échoue, l'autre est quand même retournée.
+    Retourne les offres France Travail + ATS (cache 2 min pour limiter coût API).
     """
+    c = criteres.model_dump()
+    key = hashlib.sha256(json.dumps(c, sort_keys=True).encode()).hexdigest()
+    cached, hit = _cache_get(_cache_offres, key, CACHE_OFFRES_TTL_SEC)
+    if hit and cached:
+        return cached
     offres_ft = []
     offres_ats = []
     erreurs = []
-
-    # Source 1 : France Travail
     try:
-        offres_ft = rechercher_offres(criteres.dict())
+        offres_ft = rechercher_offres(c)
     except Exception as e:
         erreurs.append(f"France Travail : {str(e)}")
-
-    # Source 2 : ATS (Lever / Greenhouse)
     try:
         offres_ats = scraper_tous_ats(mots_cles=criteres.motsCles)
     except Exception as e:
         erreurs.append(f"ATS : {str(e)}")
-
     toutes = offres_ft + offres_ats
-
-    return {
+    out = {
         "success": True,
         "offres": toutes,
         "total": len(toutes),
-        "sources": {
-            "france_travail": len(offres_ft),
-            "ats": len(offres_ats)
-        },
-        "erreurs": erreurs  # vide si tout va bien, utile pour le debug
+        "sources": {"france_travail": len(offres_ft), "ats": len(offres_ats)},
+        "erreurs": erreurs,
+=======
+        raise HTTPException(500, "pymupdf non installé")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/offres/toutes")
+def get_offres(criteres: CriteresRecherche, user=Depends(verifier_token)):
+    poste = criteres.motsCles.strip()
+    page = getattr(criteres, "page", 1) or 1
+    page_size = 30
+
+    # Si poste vide → recherche générique, pas de filtre titre
+    if poste:
+        variantes = expand_mots_cles(poste)
+        # Utiliser les 3 premières variantes pour scraper (plus d'offres, meilleure qualité)
+        variantes_scraping = variantes[:3] if variantes else [poste]
+        mots_recherche = variantes[0] if variantes else poste
+    else:
+        variantes = []
+        variantes_scraping = []
+        mots_recherche = ""
+
+    localisation = criteres.localisation or ""
+    type_contrat = criteres.typeContrat or ""
+    cache_hit = False
+
+    # ── Vérifier le cache ──
+    cached_data, cached_erreurs, cache_hit = cache_get(mots_recherche, localisation, type_contrat)
+
+    if cache_hit:
+        toutes = cached_data
+        erreurs_ft = []
+        erreurs_ats = cached_erreurs or []
+    else:
+        offres_ft, erreurs_ft = [], []
+        try:
+            # Scraper France Travail avec toutes les variantes
+            seen_ft = set()
+            for v in (variantes[:5] if variantes else [mots_recherche]):  # Max 5 variantes
+                criteres_ft = criteres.dict()
+                criteres_ft["motsCles"] = v
+                for o in scraper_ft(criteres_ft):
+                    key = (o.get("titre","").lower(), o.get("entreprise","").lower())
+                    if key not in seen_ft:
+                        seen_ft.add(key)
+                        offres_ft.append(o)
+        except Exception as e:
+            erreurs_ft = [f"France Travail: {str(e)}"]
+
+        # Scraper ATS avec toutes les variantes EN PARALLÈLE
+        seen_ats = set()
+        offres_ats_all = []
+        erreurs_ats = []
+        toutes_variantes = variantes[:5] if variantes else [mots_recherche]  # Max 5 variantes pour éviter le rate limiting
+
+        def scraper_variante(v):
+            return scraper_tous(mots=v, localisation=localisation, type_contrat=type_contrat)
+
+        with ThreadPoolExecutor(max_workers=len(toutes_variantes)) as ex_var:
+            futures_var = {ex_var.submit(scraper_variante, v): v for v in toutes_variantes}
+            for future in as_completed(futures_var, timeout=60):
+                try:
+                    ats_res, ats_err = future.result()
+                    for o in ats_res:
+                        key = (o.get("titre","").lower(), o.get("entreprise","").lower())
+                        if key not in seen_ats:
+                            seen_ats.add(key)
+                            offres_ats_all.append(o)
+                    erreurs_ats.extend(ats_err)
+                except Exception as e:
+                    erreurs_ats.append(str(e))
+
+        offres_ats = offres_ats_all
+        toutes = offres_ft + offres_ats
+        # Mettre en cache avant filtres (filtres appliqués côté affichage)
+        cache_set(mots_recherche, localisation, type_contrat, toutes, erreurs_ats)
+
+    # Filtre 1 : titre — souple, accepte correspondance partielle sur variantes courtes
+    if variantes:
+        def titre_correspond(titre: str) -> bool:
+            titre_lower = titre.lower()
+            for v in variantes:
+                v_lower = v.lower()
+                # Correspondance exacte de la variante dans le titre
+                if v_lower in titre_lower:
+                    return True
+                # Pour les variantes longues (2+ mots), matcher si tous les mots sont présents
+                mots_v = v_lower.split()
+                if len(mots_v) >= 2 and all(m in titre_lower for m in mots_v):
+                    return True
+            return False
+        toutes_filtrees = [o for o in toutes if titre_correspond(o.get("titre", ""))]
+        # Si moins de 5 offres après filtre titre → désactiver le filtre (trop restrictif)
+        if len(toutes_filtrees) < 5:
+            toutes_filtrees = toutes
+    else:
+        toutes_filtrees = toutes
+
+    # Filtre 2 : localisation — appliqué UNIQUEMENT sur les offres France Travail
+    # Les ATS (Lever, Greenhouse, SmartRecruiters, Workday) sont des portails globaux :
+    # leurs offres sans lieu ou avec lieu étranger sont quand même pertinentes si le titre correspond.
+    # France Travail est la seule source déjà filtrée par ville via l'API (code INSEE).
+    # On ne filtre donc pas les ATS par lieu pour ne pas perdre les offres locales
+    # qui ont un lieu mal renseigné ("Marseille, fr", "13009 Marseille", etc.)
+    # → Le filtre localisation est désactivé côté backend pour les ATS.
+    # La localisation est déjà passée à France Travail via le code INSEE.
+
+    # Filtre 3 : ancienneté — on élimine les offres de plus de 14 jours
+    # Si pas de date renseignée → on garde (bénéfice du doute)
+    from datetime import datetime, timezone, timedelta
+    import re as _re2
+
+    LIMITE = datetime.now(timezone.utc) - timedelta(days=45)
+
+    def date_ok(date_str: str) -> bool:
+        if not date_str or date_str.strip() == "":
+            return True  # pas de date → on garde
+        # Formats courants : ISO 8601, DD/MM/YYYY, YYYY-MM-DD
+        formats = [
+            "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d",
+            "%d/%m/%Y", "%d-%m-%Y",
+        ]
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(date_str[:26], fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt >= LIMITE
+            except ValueError:
+                continue
+        return True  # format non reconnu → on garde
+
+    # Filtre date appliqué uniquement sur France Travail (dates fiables)
+    # Les ATS ont souvent des dates incorrectes ou manquantes → on ne filtre pas
+    offres_ft_filtrees = [o for o in toutes_filtrees if o.get("source") != "France Travail" or date_ok(o.get("date_publication", ""))]
+    toutes_filtrees = offres_ft_filtrees
+
+    sources = {}
+    for o in toutes_filtrees:
+        src = o.get("source", "Autre")
+        sources[src] = sources.get(src, 0) + 1
+
+    # ── Pagination ──
+    total = len(toutes_filtrees)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    end = start + page_size
+    offres_page = toutes_filtrees[start:end]
+
+    return {
+        "success": True,
+        "offres": offres_page,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_prev": page > 1,
+        "variantes": variantes,
+        "sources": sources,
+        "cache_hit": cache_hit,
+        "erreurs": erreurs_ft + erreurs_ats,
+        "debug": {
+            "total_brut": len(toutes),
+            "apres_filtres": total,
+            "page_actuelle": page,
+        }
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     }
+    _cache_set(_cache_offres, key, out)
+    return out
 
 @app.post("/ia/analyser-cv")
 def route_analyser_cv(demande: AnalyseCV, user=Depends(verifier_token)):
     try:
         return {"success": True, "profil": analyser_cv(demande.texte_cv)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
+
+# Score IA désactivé (économie de tokens OpenAI) — réponse fixe sans appel API
+SCORE_PLACEHOLDER = {"score": None, "points_forts": [], "points_faibles": [], "recommandation": ""}
 
 @app.post("/ia/scorer")
+<<<<<<< HEAD
 def route_scorer(demande: DemandeScoring, user=Depends(verifier_token)):
+    """Score désactivé : retourne une structure vide (aucun appel OpenAI)."""
+    return {"success": True, "score": SCORE_PLACEHOLDER}
+=======
+def route_scorer(demande: DemandeScoring, user=Depends(verifier_abonnement)):
     try:
-        return {"success": True, "score": scorer_compatibilite(demande.profil, demande.offre)}
+        return {"success": True, "score": scorer(demande.profil, demande.offre)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
+
+@app.post("/ia/scorer-batch")
+def route_scorer_batch(req: dict, user=Depends(verifier_abonnement)):
+    try:
+        profil = req.get("profil", {})
+        offres = req.get("offres", [])
+        resultats = []
+        for o in offres[:10]:
+            try:
+                s = scorer(profil, o)
+                resultats.append({"id": o.get("id"), "score": s})
+            except:
+                resultats.append({"id": o.get("id"), "score": {"score": 65, "points_forts": [], "points_faibles": [], "recommandation": ""}})
+        return {"success": True, "resultats": resultats}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 @app.post("/ia/lettre")
-def route_lettre(demande: DemandeLettre, user=Depends(verifier_token)):
+def route_lettre(demande: DemandeLettre, user=Depends(verifier_abonnement)):
     try:
-        return {"success": True, "lettre": generer_lettre_motivation(demande.profil, demande.offre)}
+        return {"success": True, "lettre": generer_lettre(demande.profil, demande.offre)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
+
+@app.post("/ia/adapter-lettre")
+def route_adapter_lettre(demande: DemandeAdapterLettre, user=Depends(verifier_abonnement)):
+    """Adapte la LM personnelle de l'utilisateur à l'offre"""
+    try:
+        lm_adaptee = adapter_lettre(demande.profil, demande.offre, demande.lm_base)
+        return {"success": True, "lettre": lm_adaptee}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
 
 @app.post("/ia/package-complet")
+<<<<<<< HEAD
 def route_package_complet(demande: DemandeCV, user=Depends(verifier_token)):
+    """Lettre de motivation uniquement (scoring et adaptation CV désactivés pour économiser les tokens)."""
     try:
-        score = scorer_compatibilite(demande.profil, demande.offre)
-        cv_adapte = adapter_cv(demande.profil, demande.offre, demande.cv_original)
         lettre = generer_lettre_motivation(demande.profil, demande.offre)
-        return {"success": True, "score": score, "cv_adapte": cv_adapte, "lettre": lettre}
+        return {"success": True, "score": SCORE_PLACEHOLDER, "cv_adapte": demande.cv_original or "", "lettre": lettre}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/me/plan")
+def get_my_plan(current_user_id: str = Depends(get_current_user_id)):
+    """Retourne le plan de l'utilisateur (free | premium)."""
+    return {"success": True, "plan": get_user_plan(current_user_id)}
+
+# ─── Candidatures : Supabase ou JSON selon config ───
+def _fetch_candidatures(user_id: str) -> list:
+    if _use_supabase():
+        try:
+            sb = get_supabase()
+            r = sb.table("candidatures").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+            rows = r.data or []
+            return [{
+                "id": row.get("id"),
+                "offre": row.get("offre", {}),
+                "score": row.get("score", {}),
+                "cv_adapte": row.get("cv_adapte"),
+                "lettre": row.get("lettre"),
+                "statut": row.get("statut", "prête"),
+                "date_preparation": row.get("date_preparation"),
+                "date_candidature": row.get("date_candidature"),
+                "date_reponse": row.get("date_reponse"),
+            } for row in rows]
+        except Exception:
+            return []
+    path = f"candidatures_{user_id}.json"
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+        return [{
+            "id": r.get("id"),
+            "offre": r.get("offre", {}),
+            "score": r.get("score", {}),
+            "cv_adapte": r.get("cv_adapte"),
+            "lettre": r.get("lettre"),
+            "statut": r.get("statut", "prête"),
+            "date_preparation": r.get("date_preparation"),
+            "date_candidature": r.get("date_candidature"),
+            "date_reponse": r.get("date_reponse"),
+        } for r in rows]
+    except Exception:
+        return []
+
+@app.get("/candidatures/me")
+def get_my_candidatures(current_user_id: str = Depends(get_current_user_id)):
+    """Liste les candidatures de l'utilisateur connecté (user_id dérivé du JWT)."""
+    try:
+        return {"success": True, "candidatures": _fetch_candidatures(current_user_id)}
+    except HTTPException:
+        raise
+=======
+def route_package(demande: DemandePackageComplet, user=Depends(verifier_abonnement)):
+    """Score + LM adaptée (depuis base perso ou générée depuis zéro)"""
+    try:
+        s = scorer(demande.profil, demande.offre)
+        if demande.lm_base and demande.lm_base.strip():
+            lettre = adapter_lettre(demande.profil, demande.offre, demande.lm_base)
+        else:
+            lettre = generer_lettre(demande.profil, demande.offre)
+        return {"success": True, "score": s, "lettre": lettre}
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/ia/lettre-pdf")
+async def route_lettre_pdf(demande: DemandeLMPDF, user=Depends(verifier_token)):
+    """Génère un PDF propre depuis le texte de la LM (éventuellement modifié par l'utilisateur)"""
+    try:
+        pdf_bytes = generer_pdf_lm(
+            demande.texte_lm,
+            demande.titre_offre,
+            demande.entreprise,
+            demande.nom_candidat
+        )
+        from fastapi.responses import Response
+        return Response(content=pdf_bytes, media_type="application/pdf",
+                        headers={"Content-Disposition": "attachment; filename=lettre_motivation.pdf"})
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ── Profil ──
+@app.post("/cv/sauvegarder")
+def sauvegarder_cv(req: SauvegardeCV, user=Depends(verifier_token)):
+    """Sauvegarde le CV (texte + base64) sur le serveur — persistant entre sessions"""
+    try:
+        data = charger_user(req.user_id)
+        data["cv_texte"] = req.cv_texte
+        if req.cv_base64:
+            data["cv_base64"] = req.cv_base64
+        sauver_user(req.user_id, data)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/user/sauvegarder")
+def sauvegarder_profil(req: SauvegardeProfile, user=Depends(verifier_token)):
+    try:
+        data = charger_user(req.user_id)
+        data["profil"] = req.profil
+        data["criteres"] = req.criteres
+        if req.lm_base is not None:
+            data["lm_base"] = req.lm_base
+        sauver_user(req.user_id, data)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/user/{user_id}")
+def charger_profil(user_id: str, user=Depends(verifier_token)):
+    try:
+        return {"success": True, "data": charger_user(user_id)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ── Favoris ──
+@app.post("/favoris/ajouter")
+def ajouter_favori(req: SauvegardeOffre, user=Depends(verifier_token)):
+    try:
+        data = charger_user(req.user_id)
+        if not any(f.get("id") == req.offre.get("id") for f in data.get("favoris", [])):
+            data.setdefault("favoris", []).append({**req.offre, "sauvegarde_le": datetime.now().isoformat()})
+        sauver_user(req.user_id, data)
+        return {"success": True, "total": len(data["favoris"])}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/favoris/supprimer")
+def supprimer_favori(req: SauvegardeOffre, user=Depends(verifier_token)):
+    try:
+        data = charger_user(req.user_id)
+        data["favoris"] = [f for f in data.get("favoris", []) if f.get("id") != req.offre.get("id")]
+        sauver_user(req.user_id, data)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/favoris/{user_id}")
+def get_favoris(user_id: str, user=Depends(verifier_token)):
+    try:
+        return {"success": True, "favoris": charger_user(user_id).get("favoris", [])}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ── Candidatures ──
+@app.post("/candidatures/maj")
+def maj_candidature(req: MajCandidature, user=Depends(verifier_token)):
+    try:
+        data = charger_user(req.user_id)
+        cands = data.setdefault("candidatures", [])
+        existing = next((c for c in cands if c.get("offre_id") == req.offre_id), None)
+        now = datetime.now().isoformat()
+        if existing:
+            existing["statut"] = req.statut
+            existing["maj_le"] = now
+        else:
+            cands.append({"offre_id": req.offre_id, "offre": req.offre or {}, "statut": req.statut, "cree_le": now, "maj_le": now})
+        sauver_user(req.user_id, data)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 @app.get("/candidatures/{user_id}")
-def get_candidatures(user_id: str, user=Depends(verifier_token)):
+def get_candidatures(user_id: str, current_user_id: str = Depends(get_current_user_id)):
+    """Rétrocompatibilité : même réponse que /candidatures/me si user_id = JWT, sinon 403."""
+    if user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="Accès interdit à ce compte")
     try:
-        fichier = f"candidatures_{user_id}.json"
-        if not os.path.exists(fichier):
-            return {"success": True, "candidatures": []}
-        with open(fichier, "r", encoding="utf-8") as f:
-            return {"success": True, "candidatures": json.load(f)}
+<<<<<<< HEAD
+        return {"success": True, "candidatures": _fetch_candidatures(current_user_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/stats/{user_id}")
-def get_stats(user_id: str, user=Depends(verifier_token)):
+@app.post("/candidatures")
+def create_candidature(body: CandidatureCreate, current_user_id: str = Depends(get_current_user_id)):
+    """Enregistre une candidature. Gratuit : max 3/jour ; Premium : illimité."""
+    plan = get_user_plan(current_user_id)
+    if plan == "free":
+        n = count_candidatures_aujourd_hui(current_user_id)
+        if n >= LIMIT_CANDIDATURES_FREE:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Limite du plan Gratuit atteinte ({LIMIT_CANDIDATURES_FREE} candidatures/jour). Passe en Premium pour débloquer."
+            )
+    row = {
+        "offre": body.offre,
+        "score": body.score,
+        "cv_adapte": body.cv_adapte or "",
+        "lettre": body.lettre or "",
+        "statut": "prête",
+        "date_preparation": datetime.now(timezone.utc).isoformat(),
+        "date_candidature": None,
+        "date_reponse": None,
+    }
+    if _use_supabase():
+        try:
+            sb = get_supabase()
+            insert_row = {**row, "user_id": current_user_id}
+            r = sb.table("candidatures").insert(insert_row).execute()
+            data = (r.data or [{}])[0]
+            return {"success": True, "id": data.get("id"), "candidature": {**row, "id": data.get("id")}}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    # Fallback JSON
+    import uuid
+    cid = str(uuid.uuid4())
+    path = f"candidatures_{current_user_id}.json"
+    existing = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+    existing.insert(0, {"id": cid, **row})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+    return {"success": True, "id": cid, "candidature": {**row, "id": cid}}
+
+def _fetch_stats(user_id: str) -> dict:
+    rows = []
+    if _use_supabase():
+        try:
+            sb = get_supabase()
+            r = sb.table("candidatures").select("statut").eq("user_id", user_id).execute()
+            rows = r.data or []
+        except Exception:
+            pass
+    else:
+        path = f"candidatures_{user_id}.json"
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    rows = json.load(f)
+            except Exception:
+                pass
+    total = len(rows)
+    envoyees = len([c for c in rows if c.get("statut") in ["envoyée", "vue", "entretien", "refus", "acceptée"]])
+    entretiens = len([c for c in rows if c.get("statut") == "entretien"])
+    taux = round((entretiens / envoyees * 100) if envoyees > 0 else 0, 1)
+    return {"total": total, "envoyees": envoyees, "entretiens": entretiens, "taux_reponse": taux}
+
+@app.get("/stats/me")
+def get_my_stats(current_user_id: str = Depends(get_current_user_id)):
+    """Statistiques de l'utilisateur connecté."""
     try:
-        fichier = f"candidatures_{user_id}.json"
-        if not os.path.exists(fichier):
-            return {"success": True, "stats": {"total": 0, "envoyees": 0, "entretiens": 0, "taux_reponse": 0}}
-        with open(fichier, "r", encoding="utf-8") as f:
-            candidatures = json.load(f)
-        total = len(candidatures)
-        envoyees = len([c for c in candidatures if c["statut"] in ["envoyée", "vue", "entretien", "refus", "acceptée"]])
-        entretiens = len([c for c in candidatures if c["statut"] == "entretien"])
-        taux = round((entretiens / envoyees * 100) if envoyees > 0 else 0, 1)
-        return {"success": True, "stats": {"total": total, "envoyees": envoyees, "entretiens": entretiens, "taux_reponse": taux}}
+        return {"success": True, "stats": _fetch_stats(current_user_id)}
+    except HTTPException:
+        raise
+=======
+        data = charger_user(user_id)
+        cands = data.get("candidatures", [])
+        entretiens = len([c for c in cands if c.get("statut") == "entretien"])
+        return {"success": True, "candidatures": cands, "stats": {"total": len(cands), "entretiens": entretiens, "taux": round(entretiens/len(cands)*100 if cands else 0, 1)}}
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
+
+<<<<<<< HEAD
+@app.get("/stats/{user_id}")
+def get_stats(user_id: str, current_user_id: str = Depends(get_current_user_id)):
+    """Rétrocompatibilité : stats uniquement pour le user_id du JWT, sinon 403."""
+    if user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="Accès interdit à ce compte")
+    return {"success": True, "stats": _fetch_stats(current_user_id)}
+=======
+
+# ══════════════════════════════════════════════
+# 🗄️  CACHE
+# ══════════════════════════════════════════════
+
+@app.post("/cache/vider")
+def vider_cache(user=Depends(verifier_token)):
+    """Vide le cache des offres (admin / debug)"""
+    cache_clear()
+    return {"success": True, "message": "Cache vidé"}
+
+@app.get("/cache/stats")
+def stats_cache(user=Depends(verifier_token)):
+    with _cache_lock:
+        nb = len(_cache_offres)
+        details = [{"key": k[:8]+"...", "age_s": round(time.time()-v["ts"]), "nb_offres": len(v["data"])} for k,v in _cache_offres.items()]
+    return {"success": True, "entrees": nb, "ttl_s": CACHE_TTL, "details": details}
+
+# ══════════════════════════════════════════════
+# 📧  ALERTES EMAIL
+# ══════════════════════════════════════════════
+
+def envoyer_email_alerte(destinataire: str, nom: str, offres: list, poste: str):
+    """Envoie un email HTML via l'API HTTP Resend (pas SMTP)"""
+    resend_key = SMTP_PASS  # La clé Resend est stockée dans SMTP_PASS
+    if not resend_key:
+        print("[EMAIL] Clé Resend manquante (SMTP_PASS)")
+        return False
+    try:
+        offres_html = "".join([f"""
+        <div style="border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin-bottom:16px;background:#fff;">
+            <div style="font-size:16px;font-weight:700;color:#0f172a;">{o.get('titre','—')}</div>
+            <div style="color:#64748b;font-size:14px;margin:6px 0;">🏢 {o.get('entreprise','—')} &nbsp;·&nbsp; 📍 {o.get('lieu','—')} &nbsp;·&nbsp; 📄 {o.get('contrat','—')}</div>
+            <a href="{o.get('url','#')}" style="display:inline-block;margin-top:10px;background:#4f46e5;color:#fff;padding:8px 18px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;">Voir l'offre →</a>
+        </div>""" for o in offres[:10]])
+
+        html = f"""<!DOCTYPE html><html><body style="font-family:sans-serif;background:#f1f5f9;padding:24px;">
+        <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+            <div style="background:#4f46e5;padding:28px 32px;">
+                <div style="color:#fff;font-size:24px;font-weight:800;">JobAlert 🎯</div>
+                <div style="color:#c7d2fe;font-size:14px;margin-top:4px;">{len(offres)} nouvelle(s) offre(s) pour "{poste}"</div>
+            </div>
+            <div style="padding:28px 32px;">
+                <p style="color:#64748b;margin-bottom:20px;">Bonjour {nom or 'là'} 👋,<br>Voici les offres détectées aujourd'hui :</p>
+                {offres_html}
+                <div style="text-align:center;margin-top:24px;">
+                    <a href="https://jobalertkb.fr/app" style="background:#4f46e5;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;">Accéder à mon dashboard →</a>
+                </div>
+            </div>
+            <div style="padding:16px 32px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:12px;text-align:center;">JobAlert by KB — Tu reçois cet email car tu as activé les alertes</div>
+        </div></body></html>"""
+
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "from": "JobAlert <onboarding@resend.dev>",
+                "to": [destinataire],
+                "subject": f"🎯 {len(offres)} nouvelle(s) offre(s) pour {poste} — JobAlert",
+                "html": html
+            },
+            timeout=15
+        )
+        if response.status_code in (200, 201):
+            print(f"[EMAIL] Envoyé à {destinataire} via Resend API")
+            return True
+        else:
+            print(f"[EMAIL] Erreur Resend: {response.status_code} — {response.text}")
+            return False
+    except Exception as e:
+        print(f"[EMAIL] Erreur: {e}")
+        return False
+
+@app.post("/alertes/configurer")
+def configurer_alerte(req: AlerteEmail, user=Depends(verifier_token)):
+    """Sauvegarde les préférences d'alerte email d'un utilisateur"""
+    try:
+        data = charger_user(req.user_id)
+        data["alerte_email"] = {
+            "email": req.email,
+            "poste": req.poste,
+            "ville": req.ville,
+            "contrat": req.contrat,
+            "score_min": req.score_min,
+            "active": req.active,
+            "cree_le": datetime.now().isoformat()
+        }
+        sauver_user(req.user_id, data)
+        return {"success": True, "message": "Alerte configurée"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/alertes/tester/{user_id}")
+def tester_alerte(user_id: str, user=Depends(verifier_token)):
+    """Envoie un email de test immédiat sans scraping"""
+    try:
+        data = charger_user(user_id)
+        alerte = data.get("alerte_email", {})
+        profil = data.get("profil", {})
+        if not alerte.get("email"):
+            raise HTTPException(400, "Pas d'alerte configurée — sauvegarde d'abord ton email")
+        if not SMTP_PASS:
+            raise HTTPException(400, "Clé Resend manquante — ajoute SMTP_PASS dans Railway")
+
+        # Email de test avec offres fictives — pas de scraping pour rester rapide
+        offres_test = [
+            {"titre": "Développeur Python", "entreprise": "JobAlert Test", "lieu": "Paris", "contrat": "CDI", "url": "https://jobalertkb.fr/app"},
+            {"titre": "Data Analyst", "entreprise": "StartupTest", "lieu": "Lyon", "contrat": "CDI", "url": "https://jobalertkb.fr/app"},
+        ]
+        nom = profil.get("nom", "") or alerte["email"].split("@")[0]
+        ok = envoyer_email_alerte(alerte["email"], nom, offres_test, alerte.get("poste","ton poste"))
+        if not ok:
+            raise HTTPException(500, "Échec envoi email — vérifiez les logs Railway")
+        return {"success": True, "email": alerte["email"], "message": "Email de test envoyé !"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/alertes/{user_id}")
+def get_alerte(user_id: str, user=Depends(verifier_token)):
+    """Récupère la config d'alerte d'un utilisateur"""
+    data = charger_user(user_id)
+    return {"success": True, "alerte": data.get("alerte_email", {})}
+
+# ══════════════════════════════════════════════
+# 📊  ANALYTICS
+# ══════════════════════════════════════════════
+
+@app.get("/analytics/{user_id}")
+def get_analytics(user_id: str, user=Depends(verifier_token)):
+    """Statistiques complètes d'un utilisateur"""
+    try:
+        data = charger_user(user_id)
+        cands = data.get("candidatures", [])
+        favs = data.get("favoris", [])
+
+        statuts = {"postule":0,"attente":0,"entretien":0,"refus":0}
+        for c in cands:
+            s = c.get("statut","postule")
+            statuts[s] = statuts.get(s,0) + 1
+
+        sources_cands = {}
+        for c in cands:
+            src = c.get("offre",{}).get("source","Autre")
+            sources_cands[src] = sources_cands.get(src,0) + 1
+
+        # Activité par jour (30 derniers jours)
+        activite = {}
+        for c in cands:
+            try:
+                d = datetime.fromisoformat(c.get("cree_le","")).strftime("%Y-%m-%d")
+                activite[d] = activite.get(d,0) + 1
+            except: pass
+
+        entretiens = statuts.get("entretien",0)
+        taux_reponse = round(entretiens/len(cands)*100,1) if cands else 0
+
+        return {
+            "success": True,
+            "stats": {
+                "candidatures_total": len(cands),
+                "favoris_total": len(favs),
+                "entretiens": entretiens,
+                "taux_reponse": taux_reponse,
+                "statuts": statuts,
+                "sources": sources_cands,
+                "activite_par_jour": activite
+            }
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ══════════════════════════════════════════════
+# 💳  BILLING — STRIPE
+# ══════════════════════════════════════════════
+import stripe as _stripe
+
+STRIPE_SECRET_KEY    = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID      = os.environ.get("STRIPE_PRICE_ID", "price_1TALz2E3fm1yXIDs9U2JEmi9")
+APP_URL              = os.environ.get("APP_URL", "https://jobalertkb.fr/app")
+
+_stripe.api_key = STRIPE_SECRET_KEY
+
+@app.get("/billing/status")
+def billing_status(user=Depends(verifier_token)):
+    """Retourne le statut d'abonnement de l'utilisateur connecté."""
+    user_id = user.get("sub", "")
+    sub = get_subscription(user_id)
+    active = is_subscribed(user_id)
+    return {
+        "subscribed": active,
+        "status": sub.get("status", "inactive"),
+        "promo": sub.get("promo", False),
+        "current_period_end": sub.get("current_period_end"),
+        "stripe_customer_id": sub.get("stripe_customer_id")
+    }
+
+
+@app.post("/billing/checkout")
+def billing_checkout(user=Depends(verifier_token)):
+    """Crée une session Stripe Checkout et retourne l'URL."""
+    user_id = user.get("sub", "")
+    email = user.get("email", "")
+    try:
+        sub = get_subscription(user_id)
+        customer_id = sub.get("stripe_customer_id")
+        if not customer_id:
+            customer = _stripe.Customer.create(email=email, metadata={"user_id": user_id})
+            customer_id = customer.id
+            set_subscription(user_id, {"stripe_customer_id": customer_id})
+        session = _stripe.checkout.Session.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            mode="subscription",
+            success_url=f"{APP_URL}?payment=success",
+            cancel_url=f"{APP_URL}?payment=cancel",
+            metadata={"user_id": user_id}
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/billing/portal")
+def billing_portal(user=Depends(verifier_token)):
+    """Ouvre le portail Stripe pour gérer/annuler l'abonnement."""
+    user_id = user.get("sub", "")
+    sub = get_subscription(user_id)
+    customer_id = sub.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(400, "Aucun abonnement trouvé.")
+    try:
+        session = _stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=APP_URL
+        )
+        return {"url": session.url}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/billing/webhook")
+async def billing_webhook(request: Request):
+    """Webhook Stripe — met à jour le statut d'abonnement."""
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        event = _stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    etype = event["type"]
+    obj = event["data"]["object"]
+
+    if etype == "checkout.session.completed":
+        user_id = obj.get("metadata", {}).get("user_id", "")
+        sub_id = obj.get("subscription")
+        if user_id and sub_id:
+            stripe_sub = _stripe.Subscription.retrieve(sub_id)
+            set_subscription(user_id, {
+                "status": "active",
+                "stripe_subscription_id": sub_id,
+                "current_period_end": stripe_sub["current_period_end"]
+            })
+
+    elif etype == "invoice.payment_succeeded":
+        sub_id = obj.get("subscription")
+        if sub_id:
+            stripe_sub = _stripe.Subscription.retrieve(sub_id)
+            cust_id = stripe_sub["customer"]
+            customers = _stripe.Customer.list(limit=1)
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/user_data?select=user_id,data&data->>subscription->>stripe_customer_id=eq.{cust_id}",
+                headers=_sb_service_headers(), timeout=5
+            )
+            if r.status_code == 200 and r.json():
+                user_id = r.json()[0]["user_id"]
+                set_subscription(user_id, {
+                    "status": "active",
+                    "current_period_end": stripe_sub["current_period_end"]
+                })
+
+    elif etype in ("customer.subscription.deleted", "invoice.payment_failed"):
+        sub_id = obj.get("id") if etype == "customer.subscription.deleted" else obj.get("subscription")
+        if sub_id:
+            cust_id = obj.get("customer")
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/user_data?select=user_id,data",
+                headers=_sb_service_headers(), timeout=5
+            )
+            if r.status_code == 200:
+                for row in r.json():
+                    s = row.get("data", {}).get("subscription", {})
+                    if s.get("stripe_customer_id") == cust_id:
+                        set_subscription(row["user_id"], {"status": "inactive"})
+                        break
+
+    return {"received": True}
+
+
+@app.post("/billing/promo")
+def billing_promo(req: dict, user=Depends(verifier_token)):
+    """Donne un accès promo à un utilisateur (admin uniquement via secret)."""
+    secret = req.get("secret", "")
+    target_user_id = req.get("user_id", "")
+    admin_secret = os.environ.get("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        raise HTTPException(403, "Non autorisé.")
+    if not target_user_id:
+        raise HTTPException(400, "user_id requis.")
+    set_subscription(target_user_id, {"promo": True, "status": "active", "current_period_end": 9999999999})
+    return {"success": True, "message": f"Accès promo activé pour {target_user_id}"}
+>>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
