@@ -1,12 +1,7 @@
 """
 SCRIPT 5 — Orchestrateur principal
 Lance la surveillance en continu et coordonne tous les scripts.
-<<<<<<< HEAD
-À lancer sur le serveur (cron ou process long).
-Toutes les clés (France Travail, OpenAI, SMTP) via variables d'environnement.
-=======
 Stockage : Supabase (table user_data + offres_vues)
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 """
 
 import os
@@ -15,13 +10,6 @@ import hashlib
 import requests
 from datetime import datetime
 
-<<<<<<< HEAD
-# Import des autres scripts (alias france_travail, ats_scraper, ia_engine, notifications)
-from france_travail import rechercher_offres, get_offres_recentes
-from ats_scraper import scraper_tous_ats
-from ia_engine import analyser_cv, scorer_compatibilite, adapter_cv, generer_lettre_motivation
-from notifications import envoyer_notification_offre
-=======
 import importlib.util, sys, pathlib
 
 def _load(short, full_name):
@@ -44,21 +32,15 @@ scorer_compatibilite        = _ia.scorer_compatibilite
 adapter_cv                  = _ia.adapter_cv
 generer_lettre_motivation   = _ia.generer_lettre_motivation
 envoyer_notification_offre  = _notif.envoyer_notification_offre
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 # ─────────────────────────────────────────────
-# CONFIGURATION (variables d'environnement)
+# CONFIGURATION
 # ─────────────────────────────────────────────
-<<<<<<< HEAD
-INTERVALLE_VERIFICATION = int(os.environ.get("ORCHESTRATEUR_INTERVALLE_SEC", "300"))  # 5 min par défaut
-SCORE_MINIMUM_NOTIFICATION = int(os.environ.get("ORCHESTRATEUR_SCORE_MIN", "70"))
-=======
 INTERVALLE_VERIFICATION  = 5 * 60  # toutes les 5 minutes
 SCORE_MINIMUM_NOTIFICATION = 70    # notifier uniquement si score >= 70%
 
 SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 
 # ─────────────────────────────────────────────

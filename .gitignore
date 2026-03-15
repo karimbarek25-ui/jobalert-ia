@@ -1,22 +1,3 @@
-<<<<<<< HEAD
-# Ne jamais committer les secrets
-.env
-.env.local
-*.pem
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
-
-# Données locales (remplacées par Supabase en prod)
-utilisateurs.json
-offres_vues.json
-candidatures_*.json
-profiles.json
-=======
 # Python
 __pycache__/
 *.py[cod]
@@ -54,4 +35,3 @@ utilisateurs.json
 # OS
 .DS_Store
 Thumbs.db
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79

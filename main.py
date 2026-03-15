@@ -1,100 +1,3 @@
-<<<<<<< HEAD
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request, Header
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Any
-import json
-import os
-import requests
-from datetime import datetime, date, timedelta, timezone
-from collections import deque
-from threading import Lock
-import hashlib
-import jwt  # PyJWT
-
-from config import (
-    MAX_PDF_BYTES,
-    MAX_CV_TEXT_CHARS,
-    MAX_JSON_BODY_BYTES,
-    MAX_OFFRES_RESULTS,
-    REQUEST_TIMEOUT_SEC,
-    OPENAI_TIMEOUT_SEC,
-    RATE_LIMIT_REQUESTS,
-    RATE_LIMIT_WINDOW_SEC,
-    RATE_LIMIT_IA_REQUESTS,
-    RATE_LIMIT_IA_WINDOW_SEC,
-    CACHE_OFFRES_TTL_SEC,
-    CACHE_SCORER_TTL_SEC,
-)
-
-app = FastAPI(title="JobAlert IA", version="1.0.0")
-
-# ─── Limite taille body (sécurité + coût) ───
-app.router.redirect_slashes = False
-
-# ─── Rate limiting en mémoire (pas de Redis requis, tu restes propriétaire) ───
-_rate_limit_lock = Lock()
-_rate_limit_store: dict[str, deque] = {}
-_ia_rate_limit_store: dict[str, deque] = {}
-
-def _rate_limit_key(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-def _check_rate_limit(store: dict, key: str, max_requests: int, window_sec: int) -> bool:
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(seconds=window_sec)
-    with _rate_limit_lock:
-        if key not in store:
-            store[key] = deque(maxlen=max_requests * 2)
-        q = store[key]
-        while q and q[0] < cutoff:
-            q.popleft()
-        if len(q) >= max_requests:
-            return False
-        q.append(now)
-    return True
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    key = _rate_limit_key(request)
-    is_ia_route = request.url.path.startswith("/ia/") or request.url.path == "/cv/extraire"
-    if is_ia_route:
-        ok = _check_rate_limit(_ia_rate_limit_store, key, RATE_LIMIT_IA_REQUESTS, RATE_LIMIT_IA_WINDOW_SEC)
-    else:
-        ok = _check_rate_limit(_rate_limit_store, key, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SEC)
-    if not ok:
-        return JSONResponse(status_code=429, content={"detail": "Trop de requêtes. Réessaie dans une minute."})
-    return await call_next(request)
-
-# ─── En-têtes de sécurité ───
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-    return response
-
-# CORS : restreint aux origines réelles (prod + dev)
-_CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "https://jobalertkb.fr,https://www.jobalertkb.fr").strip()
-CORS_ORIGINS = [o.strip() for o in _CORS_ORIGINS.split(",") if o.strip()]
-if not CORS_ORIGINS:
-    CORS_ORIGINS = ["https://jobalertkb.fr", "https://www.jobalertkb.fr"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-=======
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -110,7 +13,6 @@ import jwt
 
 LBA_API_KEY = os.environ.get("LBA_API_KEY", "")
 
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 # ══════════════════════════════════════════════
 # 🗄️  CACHE MÉMOIRE (TTL 15 min)
@@ -153,19 +55,6 @@ _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()] or 
 app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 security = HTTPBearer()
-<<<<<<< HEAD
-security_optional = HTTPBearer(auto_error=False)
-
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-LIMIT_CANDIDATURES_FREE = int(os.environ.get("LIMIT_CANDIDATURES_FREE", "3"))
-INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")  # Pour set-premium (WordPress)
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")  # Optionnel : webhook Stripe
-
-def verifier_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Vérifie le JWT Supabase. Lève une 401 si invalide. Retourne le payload avec sub = user_id."""
-=======
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
@@ -190,7 +79,6 @@ def get_jwks_client():
     return _jwks_client
 
 def verifier_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     token = credentials.credentials
     try:
         client = get_jwks_client()
@@ -240,26 +128,8 @@ def verifier_abonnement(user=Depends(verifier_token)):
         raise HTTPException(status_code=402, detail="Abonnement requis.")
     return user
 
-def get_current_user_id(payload: dict = Depends(verifier_token)) -> str:
-    """Retourne l'user_id (Supabase auth.users.id) du JWT."""
-    uid = payload.get("sub")
-    if not uid:
-        raise HTTPException(status_code=401, detail="Token invalide (sub manquant)")
-    return uid
-
-# ─── MODÈLES (validation stricte = sécurité + coût maîtrisé) ───
-def _check_json_size(v: dict, max_bytes: int = 100_000) -> dict:
-    if len(json.dumps(v, ensure_ascii=False).encode("utf-8")) > max_bytes:
-        raise ValueError("Payload trop volumineux")
-    return v
-
+# ─── MODÈLES ───
 class CriteresRecherche(BaseModel):
-<<<<<<< HEAD
-    motsCles: str = Field(..., max_length=200)
-    typeContrat: Optional[str] = Field("", max_length=20)
-    distance: Optional[int] = Field(30, ge=0, le=100)
-    nbResultats: Optional[int] = Field(20, ge=1, le=MAX_OFFRES_RESULTS)
-=======
     motsCles: str
     typeContrat: Optional[str] = ""
     localisation: Optional[str] = ""
@@ -275,145 +145,17 @@ class AlerteEmail(BaseModel):
     contrat: str = ""
     score_min: int = 70
     active: bool = True
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 class DemandeScoring(BaseModel):
     profil: dict
     offre: dict
-    @field_validator("profil", "offre")
-    @classmethod
-    def limit_size(cls, v: dict) -> dict:
-        return _check_json_size(v, 80_000)
 
-<<<<<<< HEAD
-class DemandeCV(BaseModel):
-    profil: dict
-    offre: dict
-    cv_original: str = Field(..., max_length=MAX_CV_TEXT_CHARS)
-    @field_validator("profil", "offre")
-    @classmethod
-    def limit_size(cls, v: dict) -> dict:
-        return _check_json_size(v, 80_000)
-
-=======
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 class DemandeLettre(BaseModel):
     profil: dict
     offre: dict
-    @field_validator("profil", "offre")
-    @classmethod
-    def limit_size(cls, v: dict) -> dict:
-        return _check_json_size(v, 80_000)
 
 class AnalyseCV(BaseModel):
-    texte_cv: str = Field(..., max_length=MAX_CV_TEXT_CHARS)
-
-class CandidatureCreate(BaseModel):
-    offre: dict
-    score: dict
-    cv_adapte: Optional[str] = Field("", max_length=MAX_CV_TEXT_CHARS)
-    lettre: Optional[str] = Field("", max_length=50_000)
-    @field_validator("offre")
-    @classmethod
-    def limit_offre(cls, v: dict) -> dict:
-        return _check_json_size(v, 100_000)
-    @field_validator("score")
-    @classmethod
-    def limit_score(cls, v: dict) -> dict:
-        return _check_json_size(v, 10_000)
-
-class SetPremiumBody(BaseModel):
-    user_id: str = Field(..., max_length=64)
-    plan: str = Field(..., max_length=20)
-
-# ─── STOCKAGE : Supabase si configuré, sinon JSON (aucune config manuelle requise) ───
-_supabase = None
-PROFILES_JSON = "profiles.json"
-
-def _use_supabase() -> bool:
-    """True si Supabase est configuré (URL + clé service). Sinon on utilise les fichiers JSON."""
-    return bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
-
-def get_supabase():
-    global _supabase
-    if not _use_supabase():
-        return None
-    if _supabase is None:
-        from supabase import create_client
-        _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    return _supabase
-
-def _profiles_json() -> dict:
-    """Charge profiles.json (user_id -> plan). Crée le fichier si absent."""
-    if os.path.exists(PROFILES_JSON):
-        try:
-            with open(PROFILES_JSON, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def _save_profiles(data: dict):
-    with open(PROFILES_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def get_user_plan(user_id: str) -> str:
-    """Retourne 'free' ou 'premium'. Crée le profil en free si absent."""
-    if _use_supabase():
-        try:
-            sb = get_supabase()
-            r = sb.table("profiles").select("plan").eq("user_id", user_id).execute()
-            if r.data and len(r.data) > 0:
-                return r.data[0].get("plan", "free") or "free"
-            sb.table("profiles").upsert({"user_id": user_id, "plan": "free"}, on_conflict="user_id").execute()
-            return "free"
-        except Exception:
-            return "free"
-    # Fallback JSON
-    data = _profiles_json()
-    plan = data.get(user_id, "free")
-    if user_id not in data:
-        data[user_id] = "free"
-        _save_profiles(data)
-    return plan
-
-def set_user_plan(user_id: str, plan: str) -> None:
-    """Met à jour le plan (free | premium). Utilisé par webhook Stripe / set-premium."""
-    if plan not in ("free", "premium"):
-        return
-    if _use_supabase():
-        try:
-            sb = get_supabase()
-            sb.table("profiles").upsert({"user_id": user_id, "plan": plan}, on_conflict="user_id").execute()
-        except Exception:
-            pass
-        return
-    data = _profiles_json()
-    data[user_id] = plan
-    _save_profiles(data)
-
-def count_candidatures_aujourd_hui(user_id: str) -> int:
-    """Nombre de candidatures créées aujourd'hui (UTC) pour cet utilisateur."""
-    if _use_supabase():
-        try:
-            sb = get_supabase()
-            today_start = date.today().isoformat() + "T00:00:00.000Z"
-            tomorrow_start = (date.today() + timedelta(days=1)).isoformat() + "T00:00:00.000Z"
-            r = sb.table("candidatures").select("id").eq("user_id", user_id).gte("created_at", today_start).lt("created_at", tomorrow_start).execute()
-            return len(r.data or [])
-        except Exception:
-            return 0
-    # Fallback JSON
-    path = f"candidatures_{user_id}.json"
-    if not os.path.exists(path):
-        return 0
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        today_str = date.today().isoformat()
-        return sum(1 for r in rows if (r.get("date_preparation") or r.get("created_at") or "")[:10] == today_str)
-    except Exception:
-        return 0
+    texte_cv: str
 
 class SauvegardeOffre(BaseModel):
     user_id: str
@@ -467,7 +209,7 @@ H_JSON = {
 # ─── UTILITAIRES ───
 def get_openai_client():
     from openai import OpenAI
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=OPENAI_TIMEOUT_SEC)
+    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 def match(texte: str, mots: str) -> bool:
     if not mots:
@@ -482,9 +224,6 @@ def offre(id, titre, entreprise, lieu, contrat, salaire, description, date, url,
         "date_publication": date or datetime.now().isoformat(),
         "url": url or "#", "source": source, "competences": competences or []
     }
-<<<<<<< HEAD
-    r = requests.post(url, params={"realm": "/partenaire"}, data=data, timeout=REQUEST_TIMEOUT_SEC)
-=======
 
 def get_access_token():
     r = requests.post(
@@ -494,7 +233,6 @@ def get_access_token():
               "client_secret": os.environ["CLIENT_SECRET"], "scope": "api_offresdemploiv2 o2dsoffre"},
         timeout=10
     )
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     r.raise_for_status()
     return r.json()["access_token"]
 
@@ -543,23 +281,6 @@ def scraper_ft(criteres: dict):
     }
     if criteres.get("typeContrat"):
         params["typeContrat"] = criteres["typeContrat"]
-<<<<<<< HEAD
-    r = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SEC)
-    r.raise_for_status()
-    return [{
-        "id": o.get("id"),
-        "titre": o.get("intitule"),
-        "entreprise": o.get("entreprise", {}).get("nom", "Non précisé"),
-        "lieu": o.get("lieuTravail", {}).get("libelle"),
-        "contrat": o.get("typeContratLibelle"),
-        "salaire": o.get("salaire", {}).get("libelle", "Non précisé"),
-        "description": o.get("description", ""),
-        "date_publication": o.get("dateCreation"),
-        "url": o.get("origineOffre", {}).get("urlOrigine", f"https://www.francetravail.fr/offres/emploi/offre/{o.get('id')}"),
-        "source": "France Travail",
-        "competences": [c.get("libelle") for c in o.get("competences", [])],
-    } for o in r.json().get("resultats", [])]
-=======
     if criteres.get("localisation"):
         cp = ville_vers_code_postal(criteres["localisation"])
         if cp:
@@ -580,7 +301,6 @@ def scraper_ft(criteres: dict):
         o.get("origineOffre", {}).get("urlOrigine", f"https://www.francetravail.fr/offres/emploi/offre/{o.get('id')}"),
         "France Travail", [c.get("libelle") for c in o.get("competences", [])]
     ) for o in resultats]
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 # ══════════════════════════════════════════════
 # 🟣  LEVER
@@ -589,27 +309,6 @@ def scraper_lever(entreprises: list, mots: str = ""):
     result = []
     for e in entreprises:
         try:
-<<<<<<< HEAD
-            r = requests.get(f"https://api.lever.co/v0/postings/{e['slug']}?mode=json", timeout=REQUEST_TIMEOUT_SEC)
-            for job in r.json():
-                if mots_cles and mots_cles.lower() not in job.get("text", "").lower():
-                    continue
-                offres.append({
-                    "id": f"lever_{job.get('id')}",
-                    "titre": job.get("text"),
-                    "entreprise": e["nom"],
-                    "lieu": job.get("categories", {}).get("location", "Non précisé"),
-                    "contrat": job.get("categories", {}).get("commitment", "Non précisé"),
-                    "salaire": "Non précisé",
-                    "description": job.get("descriptionPlain", "")[:300],
-                    "date_publication": datetime.utcfromtimestamp(job.get("createdAt", 0) / 1000).isoformat(),
-                    "url": job.get("hostedUrl"),
-                    "source": f"Lever ({e['nom']})",
-                    "competences": []
-                })
-        except:
-            pass
-=======
             r = requests.get(f"https://api.lever.co/v0/postings/{e['slug']}?mode=json", timeout=8, headers=H_JSON)
             for j in r.json():
                 if not match(j.get("text","") + j.get("descriptionPlain",""), mots): continue
@@ -622,7 +321,6 @@ def scraper_lever(entreprises: list, mots: str = ""):
                 ))
         except: pass
     return result
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 # ══════════════════════════════════════════════
 # 🟢  GREENHOUSE
@@ -631,67 +329,6 @@ def scraper_greenhouse(entreprises: list, mots: str = ""):
     result = []
     for e in entreprises:
         try:
-<<<<<<< HEAD
-            r = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{e['slug']}/jobs", timeout=REQUEST_TIMEOUT_SEC)
-            for job in r.json().get("jobs", []):
-                if mots_cles and mots_cles.lower() not in job.get("title", "").lower():
-                    continue
-                offres.append({
-                    "id": f"greenhouse_{job.get('id')}",
-                    "titre": job.get("title"),
-                    "entreprise": e["nom"],
-                    "lieu": job.get("location", {}).get("name", "Non précisé"),
-                    "contrat": "Non précisé",
-                    "salaire": "Non précisé",
-                    "description": "",
-                    "date_publication": job.get("updated_at", ""),
-                    "url": job.get("absolute_url"),
-                    "source": f"Greenhouse ({e['nom']})",
-                    "competences": []
-                })
-        except:
-            pass
-    return offres
-
-def analyser_cv(texte_cv):
-    client = get_openai_client()
-    prompt = f"""Analyse ce CV et extrais les informations en JSON :
-{{"nom":"...","email":"...","competences":[],"secteurs":[],"annees_experience":0,"resume_profil":"..."}}
-CV : {texte_cv}
-Réponds UNIQUEMENT avec le JSON."""
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        timeout=OPENAI_TIMEOUT_SEC,
-    )
-    contenu = r.choices[0].message.content.strip()
-    if "```" in contenu:
-        contenu = contenu.split("```")[1]
-        if contenu.startswith("json"):
-            contenu = contenu[4:]
-    return json.loads(contenu)
-
-def scorer_compatibilite(profil, offre):
-    client = get_openai_client()
-    prompt = f"""Évalue la compatibilité en JSON :
-{{"score":0,"points_forts":[],"points_faibles":[],"recommandation":""}}
-PROFIL: {json.dumps(profil, ensure_ascii=False)}
-OFFRE: Titre:{offre.get('titre')} Entreprise:{offre.get('entreprise')} Description:{offre.get('description','')[:400]}
-Réponds UNIQUEMENT avec le JSON."""
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        timeout=OPENAI_TIMEOUT_SEC,
-    )
-    contenu = r.choices[0].message.content.strip()
-    if "```" in contenu:
-        contenu = contenu.split("```")[1]
-        if contenu.startswith("json"):
-            contenu = contenu[4:]
-    return json.loads(contenu)
-=======
             r = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{e['slug']}/jobs", timeout=8, headers=H_JSON)
             for j in r.json().get("jobs", []):
                 if not match(j.get("title",""), mots): continue
@@ -755,7 +392,6 @@ def scraper_smartrecruiters(entreprises: list, mots: str = ""):
                     ))
         except: pass
     return result
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 # ══════════════════════════════════════════════
 # 🟠  WORKDAY (API JSON publique)
@@ -1410,17 +1046,6 @@ def scraper_tous(mots: str = "", localisation: str = "", type_contrat: str = "")
 # ══════════════════════════════════════════════
 def analyser_cv(texte: str):
     client = get_openai_client()
-<<<<<<< HEAD
-    prompt = f"""Adapte ce CV pour cette offre.
-OFFRE: {offre.get('titre')} chez {offre.get('entreprise')} - {offre.get('description','')[:300]}
-CV: {cv_original}
-Retourne le CV adapté directement."""
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        timeout=OPENAI_TIMEOUT_SEC,
-=======
     r = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": f"""Analyse ce CV et retourne uniquement un JSON strict :
@@ -1503,48 +1128,12 @@ PROFIL : {profil.get('resume_profil','')} — {profil.get('annees_experience',0)
 LETTRE DE BASE DE L'UTILISATEUR :
 {lm_base[:2500]}"""}],
         temperature=0.4
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     )
     return r.choices[0].message.content
 
 def generer_lettre(profil: dict, o: dict):
     """Génère une LM depuis zéro si l'utilisateur n'en a pas fourni"""
     client = get_openai_client()
-<<<<<<< HEAD
-    prompt = f"""Rédige une lettre de motivation (250-350 mots) pour ce poste.
-Poste: {offre.get('titre')} chez {offre.get('entreprise')}
-Description: {offre.get('description','')[:300]}
-Profil: {profil.get('resume_profil','')}
-Commence par une accroche mentionnant l'entreprise. Ton professionnel mais humain."""
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        timeout=OPENAI_TIMEOUT_SEC,
-    )
-    return r.choices[0].message.content
-
-# ─── Cache léger (réduire coût API / OpenAI, sans Redis = tu restes propriétaire) ───
-_cache_offres: dict[str, tuple[list, float]] = {}
-_cache_scorer: dict[str, tuple[dict, float]] = {}
-_cache_lock = Lock()
-
-def _cache_get(cache: dict, key: str, ttl_sec: int) -> tuple[Optional[Any], bool]:
-    with _cache_lock:
-        if key not in cache:
-            return None, False
-        data, ts = cache[key]
-        if (datetime.now(timezone.utc).timestamp() - ts) > ttl_sec:
-            del cache[key]
-            return None, False
-        return data, True
-
-def _cache_set(cache: dict, key: str, data: any):
-    with _cache_lock:
-        cache[key] = (data, datetime.now(timezone.utc).timestamp())
-
-# ─── ROUTES PUBLIQUES ───
-=======
     r = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": f"""Rédige une lettre de motivation percutante (300-400 mots) pour ce poste.
@@ -1659,7 +1248,6 @@ def sauver_user(user_id: str, data: dict):
 # 🌐  ROUTES API
 # ══════════════════════════════════════════════
 
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 @app.get("/")
 def root():
     return {"message": "JobAlert IA API v9.0 — En ligne ✅", "sources": ["France Travail", "Lever", "Greenhouse", "SmartRecruiters", "Workday", "Welcome to the Jungle", "Ashby", "Personio", "La Bonne Alternance", "Portails HTML"]}
@@ -1755,69 +1343,11 @@ async def debug_token(request: Request):
         except Exception as e2:
             return {"statut": "ERREUR ❌", "ES256": str(e1), "HS256": str(e2)}
 
-@app.get("/health")
-def health():
-    """Santé + mode stockage (pour déploiement sans config)."""
-    return {
-        "ok": True,
-        "storage": "supabase" if _use_supabase() else "json",
-        "auth_required": bool(SUPABASE_JWT_SECRET),
-    }
-
-# ─── Mise à jour plan (WordPress après paiement Stripe ou webhook Stripe) ───
-@app.post("/internal/set-premium")
-def internal_set_premium(body: SetPremiumBody, x_internal_secret: Optional[str] = Header(None, alias="X-Internal-Secret")):
-    """
-    Met à jour le plan d'un utilisateur (premium/free).
-    À appeler depuis WordPress après succès checkout Stripe.
-    Header requis : X-Internal-Secret = INTERNAL_SECRET (variable d'environnement).
-    """
-    if not INTERNAL_SECRET or x_internal_secret != INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Secret invalide")
-    if body.plan not in ("free", "premium"):
-        raise HTTPException(status_code=400, detail="plan doit être 'free' ou 'premium'")
-    set_user_plan(body.user_id, body.plan)
-    return {"success": True, "user_id": body.user_id, "plan": body.plan}
-
-@app.post("/webhooks/stripe")
-async def webhook_stripe(request: Request, stripe_signature: Optional[str] = Header(None, alias="Stripe-Signature")):
-    """
-    Webhook Stripe (optionnel). Si STRIPE_WEBHOOK_SECRET est défini, traite checkout.session.completed
-    et met à jour le plan. Dans l'événement, metadata ou client_reference_id doit contenir user_id (Supabase).
-    """
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=501, detail="Webhook Stripe non configuré")
-    body = await request.body()
-    if not stripe_signature:
-        raise HTTPException(status_code=400, detail="Stripe-Signature manquant")
-    try:
-        import stripe
-        event = stripe.Webhook.construct_event(body, stripe_signature, STRIPE_WEBHOOK_SECRET)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Signature Stripe invalide: {e}")
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        user_id = (session.get("metadata") or {}).get("user_id") or session.get("client_reference_id")
-        if user_id:
-            set_user_plan(user_id, "premium")
-            return {"received": True}
-    if event["type"] in ("customer.subscription.updated", "customer.subscription.deleted"):
-        # Optionnel : mapper subscription à user_id (ex. via metadata ou table stripe_customer_id -> user_id)
-        pass
-    return {"received": True}
-
 @app.post("/cv/extraire")
-<<<<<<< HEAD
-async def extraire_cv(file: UploadFile = File(...), user=Depends(verifier_token)):
-    """Extrait le texte d'un PDF uploadé — authentification requise (anti-abus)."""
-=======
 async def extraire_cv(file: UploadFile = File(...)):
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     try:
         import pymupdf
         contenu = await file.read()
-        if len(contenu) > MAX_PDF_BYTES:
-            raise HTTPException(status_code=400, detail=f"Fichier trop volumineux (max {MAX_PDF_BYTES // (1024*1024)} Mo)")
         doc = pymupdf.open(stream=contenu, filetype="pdf")
         texte = "".join(p.get_text() for p in doc)
         nb = len(doc)
@@ -1825,60 +1355,6 @@ async def extraire_cv(file: UploadFile = File(...)):
         if not texte.strip(): raise HTTPException(400, "PDF sans texte")
         return {"success": True, "texte": texte.strip(), "pages": nb}
     except ImportError:
-<<<<<<< HEAD
-        raise HTTPException(status_code=500, detail="pymupdf non installé")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─── ROUTES PROTÉGÉES (JWT Supabase requis) ───
-
-@app.post("/offres/france-travail")
-def get_offres_ft(criteres: CriteresRecherche, user=Depends(verifier_token)):
-    try:
-        offres = rechercher_offres(criteres.model_dump())
-        return {"success": True, "offres": offres, "total": len(offres)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/offres/ats")
-def get_offres_ats(criteres: CriteresRecherche, user=Depends(verifier_token)):
-    try:
-        offres = scraper_tous_ats(mots_cles=criteres.motsCles)
-        return {"success": True, "offres": offres, "total": len(offres)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/offres/toutes")
-def get_toutes_offres(criteres: CriteresRecherche, user=Depends(verifier_token)):
-    """
-    Retourne les offres France Travail + ATS (cache 2 min pour limiter coût API).
-    """
-    c = criteres.model_dump()
-    key = hashlib.sha256(json.dumps(c, sort_keys=True).encode()).hexdigest()
-    cached, hit = _cache_get(_cache_offres, key, CACHE_OFFRES_TTL_SEC)
-    if hit and cached:
-        return cached
-    offres_ft = []
-    offres_ats = []
-    erreurs = []
-    try:
-        offres_ft = rechercher_offres(c)
-    except Exception as e:
-        erreurs.append(f"France Travail : {str(e)}")
-    try:
-        offres_ats = scraper_tous_ats(mots_cles=criteres.motsCles)
-    except Exception as e:
-        erreurs.append(f"ATS : {str(e)}")
-    toutes = offres_ft + offres_ats
-    out = {
-        "success": True,
-        "offres": toutes,
-        "total": len(toutes),
-        "sources": {"france_travail": len(offres_ft), "ats": len(offres_ats)},
-        "erreurs": erreurs,
-=======
         raise HTTPException(500, "pymupdf non installé")
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -2046,10 +1522,7 @@ def get_offres(criteres: CriteresRecherche, user=Depends(verifier_token)):
             "apres_filtres": total,
             "page_actuelle": page,
         }
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     }
-    _cache_set(_cache_offres, key, out)
-    return out
 
 @app.post("/ia/analyser-cv")
 def route_analyser_cv(demande: AnalyseCV, user=Depends(verifier_token)):
@@ -2058,15 +1531,7 @@ def route_analyser_cv(demande: AnalyseCV, user=Depends(verifier_token)):
     except Exception as e:
         raise HTTPException(500, str(e))
 
-# Score IA désactivé (économie de tokens OpenAI) — réponse fixe sans appel API
-SCORE_PLACEHOLDER = {"score": None, "points_forts": [], "points_faibles": [], "recommandation": ""}
-
 @app.post("/ia/scorer")
-<<<<<<< HEAD
-def route_scorer(demande: DemandeScoring, user=Depends(verifier_token)):
-    """Score désactivé : retourne une structure vide (aucun appel OpenAI)."""
-    return {"success": True, "score": SCORE_PLACEHOLDER}
-=======
 def route_scorer(demande: DemandeScoring, user=Depends(verifier_abonnement)):
     try:
         return {"success": True, "score": scorer(demande.profil, demande.offre)}
@@ -2088,7 +1553,6 @@ def route_scorer_batch(req: dict, user=Depends(verifier_abonnement)):
         return {"success": True, "resultats": resultats}
     except Exception as e:
         raise HTTPException(500, str(e))
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 @app.post("/ia/lettre")
 def route_lettre(demande: DemandeLettre, user=Depends(verifier_abonnement)):
@@ -2108,68 +1572,6 @@ def route_adapter_lettre(demande: DemandeAdapterLettre, user=Depends(verifier_ab
 
 
 @app.post("/ia/package-complet")
-<<<<<<< HEAD
-def route_package_complet(demande: DemandeCV, user=Depends(verifier_token)):
-    """Lettre de motivation uniquement (scoring et adaptation CV désactivés pour économiser les tokens)."""
-    try:
-        lettre = generer_lettre_motivation(demande.profil, demande.offre)
-        return {"success": True, "score": SCORE_PLACEHOLDER, "cv_adapte": demande.cv_original or "", "lettre": lettre}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/me/plan")
-def get_my_plan(current_user_id: str = Depends(get_current_user_id)):
-    """Retourne le plan de l'utilisateur (free | premium)."""
-    return {"success": True, "plan": get_user_plan(current_user_id)}
-
-# ─── Candidatures : Supabase ou JSON selon config ───
-def _fetch_candidatures(user_id: str) -> list:
-    if _use_supabase():
-        try:
-            sb = get_supabase()
-            r = sb.table("candidatures").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-            rows = r.data or []
-            return [{
-                "id": row.get("id"),
-                "offre": row.get("offre", {}),
-                "score": row.get("score", {}),
-                "cv_adapte": row.get("cv_adapte"),
-                "lettre": row.get("lettre"),
-                "statut": row.get("statut", "prête"),
-                "date_preparation": row.get("date_preparation"),
-                "date_candidature": row.get("date_candidature"),
-                "date_reponse": row.get("date_reponse"),
-            } for row in rows]
-        except Exception:
-            return []
-    path = f"candidatures_{user_id}.json"
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        return [{
-            "id": r.get("id"),
-            "offre": r.get("offre", {}),
-            "score": r.get("score", {}),
-            "cv_adapte": r.get("cv_adapte"),
-            "lettre": r.get("lettre"),
-            "statut": r.get("statut", "prête"),
-            "date_preparation": r.get("date_preparation"),
-            "date_candidature": r.get("date_candidature"),
-            "date_reponse": r.get("date_reponse"),
-        } for r in rows]
-    except Exception:
-        return []
-
-@app.get("/candidatures/me")
-def get_my_candidatures(current_user_id: str = Depends(get_current_user_id)):
-    """Liste les candidatures de l'utilisateur connecté (user_id dérivé du JWT)."""
-    try:
-        return {"success": True, "candidatures": _fetch_candidatures(current_user_id)}
-    except HTTPException:
-        raise
-=======
 def route_package(demande: DemandePackageComplet, user=Depends(verifier_abonnement)):
     """Score + LM adaptée (depuis base perso ou générée depuis zéro)"""
     try:
@@ -2179,7 +1581,6 @@ def route_package(demande: DemandePackageComplet, user=Depends(verifier_abonneme
         else:
             lettre = generer_lettre(demande.profil, demande.offre)
         return {"success": True, "score": s, "lettre": lettre}
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -2282,111 +1683,15 @@ def maj_candidature(req: MajCandidature, user=Depends(verifier_token)):
         raise HTTPException(500, str(e))
 
 @app.get("/candidatures/{user_id}")
-def get_candidatures(user_id: str, current_user_id: str = Depends(get_current_user_id)):
-    """Rétrocompatibilité : même réponse que /candidatures/me si user_id = JWT, sinon 403."""
-    if user_id != current_user_id:
-        raise HTTPException(status_code=403, detail="Accès interdit à ce compte")
+def get_candidatures(user_id: str, user=Depends(verifier_token)):
     try:
-<<<<<<< HEAD
-        return {"success": True, "candidatures": _fetch_candidatures(current_user_id)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/candidatures")
-def create_candidature(body: CandidatureCreate, current_user_id: str = Depends(get_current_user_id)):
-    """Enregistre une candidature. Gratuit : max 3/jour ; Premium : illimité."""
-    plan = get_user_plan(current_user_id)
-    if plan == "free":
-        n = count_candidatures_aujourd_hui(current_user_id)
-        if n >= LIMIT_CANDIDATURES_FREE:
-            raise HTTPException(
-                status_code=402,
-                detail=f"Limite du plan Gratuit atteinte ({LIMIT_CANDIDATURES_FREE} candidatures/jour). Passe en Premium pour débloquer."
-            )
-    row = {
-        "offre": body.offre,
-        "score": body.score,
-        "cv_adapte": body.cv_adapte or "",
-        "lettre": body.lettre or "",
-        "statut": "prête",
-        "date_preparation": datetime.now(timezone.utc).isoformat(),
-        "date_candidature": None,
-        "date_reponse": None,
-    }
-    if _use_supabase():
-        try:
-            sb = get_supabase()
-            insert_row = {**row, "user_id": current_user_id}
-            r = sb.table("candidatures").insert(insert_row).execute()
-            data = (r.data or [{}])[0]
-            return {"success": True, "id": data.get("id"), "candidature": {**row, "id": data.get("id")}}
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-    # Fallback JSON
-    import uuid
-    cid = str(uuid.uuid4())
-    path = f"candidatures_{current_user_id}.json"
-    existing = []
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except Exception:
-            pass
-    existing.insert(0, {"id": cid, **row})
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, ensure_ascii=False, indent=2)
-    return {"success": True, "id": cid, "candidature": {**row, "id": cid}}
-
-def _fetch_stats(user_id: str) -> dict:
-    rows = []
-    if _use_supabase():
-        try:
-            sb = get_supabase()
-            r = sb.table("candidatures").select("statut").eq("user_id", user_id).execute()
-            rows = r.data or []
-        except Exception:
-            pass
-    else:
-        path = f"candidatures_{user_id}.json"
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    rows = json.load(f)
-            except Exception:
-                pass
-    total = len(rows)
-    envoyees = len([c for c in rows if c.get("statut") in ["envoyée", "vue", "entretien", "refus", "acceptée"]])
-    entretiens = len([c for c in rows if c.get("statut") == "entretien"])
-    taux = round((entretiens / envoyees * 100) if envoyees > 0 else 0, 1)
-    return {"total": total, "envoyees": envoyees, "entretiens": entretiens, "taux_reponse": taux}
-
-@app.get("/stats/me")
-def get_my_stats(current_user_id: str = Depends(get_current_user_id)):
-    """Statistiques de l'utilisateur connecté."""
-    try:
-        return {"success": True, "stats": _fetch_stats(current_user_id)}
-    except HTTPException:
-        raise
-=======
         data = charger_user(user_id)
         cands = data.get("candidatures", [])
         entretiens = len([c for c in cands if c.get("statut") == "entretien"])
         return {"success": True, "candidatures": cands, "stats": {"total": len(cands), "entretiens": entretiens, "taux": round(entretiens/len(cands)*100 if cands else 0, 1)}}
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
     except Exception as e:
         raise HTTPException(500, str(e))
 
-<<<<<<< HEAD
-@app.get("/stats/{user_id}")
-def get_stats(user_id: str, current_user_id: str = Depends(get_current_user_id)):
-    """Rétrocompatibilité : stats uniquement pour le user_id du JWT, sinon 403."""
-    if user_id != current_user_id:
-        raise HTTPException(status_code=403, detail="Accès interdit à ce compte")
-    return {"success": True, "stats": _fetch_stats(current_user_id)}
-=======
 
 # ══════════════════════════════════════════════
 # 🗄️  CACHE
@@ -2706,4 +2011,3 @@ def billing_promo(req: dict, user=Depends(verifier_token)):
         raise HTTPException(400, "user_id requis.")
     set_subscription(target_user_id, {"promo": True, "status": "active", "current_period_end": 9999999999})
     return {"success": True, "message": f"Accès promo activé pour {target_user_id}"}
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79

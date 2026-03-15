@@ -11,21 +11,9 @@ import json
 from openai import OpenAI
 
 # ─────────────────────────────────────────────
-# CONFIGURATION — utiliser variables d'environnement, ne jamais committer de clé
+# CONFIGURATION
 # ─────────────────────────────────────────────
-<<<<<<< HEAD
-def _get_client():
-    import os
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if not key:
-        raise ValueError("OPENAI_API_KEY doit être défini (variable d'environnement)")
-    return OpenAI(api_key=key)
-
-def _client():
-    return _get_client()
-=======
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 
 
 def analyser_cv(texte_cv: str) -> dict:
@@ -65,7 +53,7 @@ def analyser_cv(texte_cv: str) -> dict:
     Réponds UNIQUEMENT avec le JSON, sans texte avant ou après.
     """
     
-    response = _get_client().chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1
@@ -117,7 +105,7 @@ def scorer_compatibilite(profil: dict, offre: dict) -> dict:
     Réponds UNIQUEMENT avec le JSON.
     """
     
-    response = _get_client().chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1
@@ -165,7 +153,7 @@ def adapter_cv(profil: dict, offre: dict, cv_original: str) -> str:
     Retourne le CV adapté en texte formaté, prêt à être mis en page.
     """
     
-    response = _get_client().chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
@@ -208,7 +196,7 @@ def generer_lettre_motivation(profil: dict, offre: dict) -> str:
     Format de sortie : La lettre directement, sans "Objet :" ni en-tête.
     """
     
-    response = _get_client().chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7
@@ -244,7 +232,7 @@ def preparer_briefing_entretien(profil: dict, offre: dict) -> dict:
     Réponds UNIQUEMENT avec le JSON.
     """
     
-    response = _get_client().chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.5

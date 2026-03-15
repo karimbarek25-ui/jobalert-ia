@@ -6,9 +6,5 @@ python-multipart
 pydantic
 pymupdf
 PyJWT
-<<<<<<< HEAD
-supabase
-=======
 cryptography
->>>>>>> 65403d4e252353fd6afb24e82c4c3935b2017d79
 stripe
